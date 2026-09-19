@@ -24,6 +24,13 @@
  *           #STATUS:mode,rec,sd,imu,mV,%,rawDrops,envDrops,imuDrops
  *           H,… · D,ts,… · #5V:0/1
  *
+ * [SYNC] Ademas del protocolo de arriba, este lado (maestro) manda
+ * periodicamente un pulso de sincronizacion de reloj al ESP de medicion
+ * (impedancia/presion/temperatura), para que sus timestamps guardados en
+ * SD queden en la misma base de tiempo que los Sample/ImuSample de este
+ * lado (ambos expresados como "microsegundos desde que arranco ESTA
+ * grabacion", la misma referencia que ya usa recordingTimestampUs()).
+ *
  * UNDERDEVELOPMENT BY DANIEL ESCOBAR. daniel@sense-ai.co
  * Special thanks to Sense-AI! <3
  ******************************************************************************/
@@ -114,8 +121,8 @@ static constexpr gpio_num_t kPGOOD    = GPIO_NUM_4;   // Power-good (active LOW)
 
 //UART communication electrode-user interface
 #define MEDICION_UART_PORT    UART_NUM_1
-#define MEDICION_UART_TX_PIN  GPIO_NUM_17
-#define MEDICION_UART_RX_PIN  GPIO_NUM_18
+#define MEDICION_UART_TX_PIN  GPIO_NUM_4
+#define MEDICION_UART_RX_PIN  GPIO_NUM_5
 #define MEDICION_UART_BAUD    115200
 #define MEDICION_UART_BUF     256
 
@@ -130,6 +137,17 @@ static constexpr gpio_num_t kPGOOD    = GPIO_NUM_4;   // Power-good (active LOW)
 // if the test is started from python without touching any button.
 
 #define START_TEST_BYTE 0x03
+
+// [SYNC] Byte this side sends periodically to the measurement ESP while a
+// recording is running, so it can keep its own timestamps aligned with
+// recordingTimestampUs() on this side. Followed by 4 bytes (uint32_t,
+// little-endian) carrying the current value of recordingTimestampUs() --
+// microseconds elapsed since THIS recording started, the same reference
+// already used by Sample/ImuSample. MUST match SYNC_BYTE in the
+// measurement ESP's firmware, and must not collide with TRIGGER_BYTE /
+// START_TEST_BYTE above.
+#define SYNC_BYTE            0x02
+#define SYNC_INTERVAL_MS     30000
 
 static const char* TAG = "MASTER";
 
@@ -275,6 +293,12 @@ static char macStr[13] = {};
 // Session directory path (set once at SD init)
 static std::string sessionDir;
 
+// [SYNC] Last esp_timer_get_time() (absolute, not relative to recStart) at
+// which a sync pulse was sent to the measurement ESP. 0 forces the first
+// pulse to go out immediately once a recording starts, instead of waiting
+// SYNC_INTERVAL_MS.
+static int64_t lastSyncSentUs = 0;
+
 // ─────────────────────────────────────────────
 //  UART initialization toward the measurement ESP
 // ─────────────────────────────────────────────
@@ -332,6 +356,28 @@ static void sendStartToSlave(void)
 
 static uint32_t recordingTimestampUs() {
     return (uint32_t)(esp_timer_get_time() - recStart.load(std::memory_order_relaxed));
+}
+
+// ─────────────────────────────────────────────
+//  [SYNC] Sends a clock-sync pulse to the measurement ESP if
+//  SYNC_INTERVAL_MS has elapsed since the last one. Carries
+//  recordingTimestampUs() -- time elapsed since THIS recording started --
+//  so the measurement ESP's corrected timestamps land in the same
+//  reference frame as this side's own Sample/ImuSample timestamps.
+//  Fire-and-forget, same as sendTrigger()/sendStartToSlave(); called
+//  from uartTask(), which already runs at ~50 Hz while recording.
+// ─────────────────────────────────────────────
+static void sendSyncToSlaveIfDue(void)
+{
+    int64_t now = esp_timer_get_time();
+    if (now - lastSyncSentUs < (int64_t)SYNC_INTERVAL_MS * 1000) return;
+    lastSyncSentUs = now;
+
+    uint32_t elapsedUs = recordingTimestampUs();
+    uint8_t pkt[5];
+    pkt[0] = SYNC_BYTE;
+    memcpy(&pkt[1], &elapsedUs, sizeof(elapsedUs));
+    uart_write_bytes(MEDICION_UART_PORT, (const char*)pkt, sizeof(pkt));
 }
 
 static void resetDropCounters() {
@@ -736,6 +782,11 @@ static void uartTask(void*) {
             continue;
         }
 
+        // [SYNC] Runs at the top of every iteration while recording (~50 Hz);
+        // internally no-ops unless SYNC_INTERVAL_MS has elapsed since the
+        // last pulse, so it doesn't add meaningful overhead to this loop.
+        sendSyncToSlaveIfDue();
+
         /* En modo UDP-solo no basta con que printf no escriba: armar la linea
          * cuesta 16 lecturas de ADC y una docena de snprintf 50 veces por
          * segundo. Se salta entera. */
@@ -1023,8 +1074,7 @@ static bool countdown(int seconds) {
                 // than matching raw bytes. Matching raw bytes meant any '0'
                 // *inside* a multi-byte command aborted the countdown: "S0"
                 // aborted instead of selecting sensor 0, and "L0,1" -- which
-                // hosts routinely send right after a mode command -- aborted
-                // every time. feedUartByte() consumes 'L'/'G' lines whole, so
+                // hosts routinely send right after a
                 // only a genuinely standalone '0' can reach the abort test.
                 int c = feedUartByte(rx);
                 if (c == '0') {
@@ -1158,6 +1208,7 @@ static bool startRecording() {
     if (sdOK) commandSdWriter(SdCommand::Open);
     recStart.store(esp_timer_get_time(), std::memory_order_relaxed);
     recording = true;
+    lastSyncSentUs = 0;  // [SYNC] force an immediate sync pulse for this new recording
     sendStartToSlave();  // notify the measurement ESP (in case the start came from python/reed and not its own button)
     if (!startADCs()) return false;
     updateStatusLed();
@@ -1215,6 +1266,8 @@ static void stopTest() {
 //      recording must not continue unchecked.
 // ─────────────────────────────────────────────
 static constexpr uint32_t kBotonHoldMs = 3000;
+static constexpr int64_t  kBotonDebounceUs = 30000;
+static int64_t botonUltimoEdgeAceptadoUs = 0;
 static int64_t botonPresionadoDesdeUs = 0;
 static bool    botonHoldDisparado     = false;
 // Guard against the following bug: startRecording() calls countdown(3),
@@ -1320,6 +1373,10 @@ static void checkStartButton() {
     // completed entirely between two loop iterations is never lost.
     BotonEdge e;
     while (xQueueReceive(botonEdgeQ, &e, 0) == pdTRUE) {
+        if (e.tsUs - botonUltimoEdgeAceptadoUs < kBotonDebounceUs) {
+            continue;
+        }
+        botonUltimoEdgeAceptadoUs = e.tsUs;
         printf("#BOTON_RAW:%d,%lld\n", e.nivel == 0 ? 1 : 0, (long long)e.tsUs);
         procesarEstadoBoton(e.nivel == 0, e.tsUs);
     }
@@ -1857,6 +1914,7 @@ extern "C" void app_main() {
         if (sdOK) commandSdWriter(SdCommand::Open);
         recStart.store(esp_timer_get_time(), std::memory_order_relaxed);
         recording = true;
+        lastSyncSentUs = 0;  // [SYNC] force an immediate sync pulse for this new recording
         sendStartToSlave();  // notify the measurement ESP (in case the start came from python/reed and not its own button)
         updateStatusLed();
         printf("#REC\n");
