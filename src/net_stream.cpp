@@ -38,9 +38,9 @@ constexpr int kMaxImuRecs   = kMaxPayload / sizeof(ImuSample);  // 69
 constexpr uint32_t kFlushMs = 30;               // partial-batch latency bound
 
 // Queue sizes: sender drains every few ms, these only ride out WiFi hiccups
-constexpr int kRawQLen = 2000;   // ≈ 200 ms in All mode
-constexpr int kEnvQLen = 500;
-constexpr int kImuQLen = 200;
+constexpr int kRawQLen = 1000;   // ~120 ms; reserve RAM for primary SD stream
+constexpr int kEnvQLen = 256;
+constexpr int kImuQLen = 100;
 
 std::atomic<bool> active{false};
 bool wifiInited   = false;   // one-time esp_netif/event/wifi init done
@@ -56,6 +56,7 @@ QueueHandle_t imuQ = nullptr;
 int sock = -1;
 sockaddr_in clientAddr = {};
 bool clientKnown = false;
+bool (*storagePressureProbe)() = nullptr;
 
 std::atomic<uint32_t> txPackets{0};
 std::atomic<uint32_t> dropCount{0};
@@ -189,6 +190,14 @@ void netTask(void*) {
             (uint32_t)(esp_timer_get_time() / 1000) - lastClientMs > kQuietWatchdogMs) {
             hostSetUartQuiet(false);
             printf("#UART:1,watchdog\n");
+        }
+
+        // Keep subscription/quiet recovery responsive, but stop adding Wi-Fi
+        // work when primary storage needs to catch up. Queue overflow remains
+        // explicitly counted by the existing enqueue paths.
+        if (storagePressureProbe && storagePressureProbe()) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
         }
 
         uint32_t nowMs = (uint32_t)(esp_timer_get_time() / 1000);
@@ -373,3 +382,5 @@ uint32_t netPacketsSent() {
 uint32_t netDropCount() {
     return dropCount.load(std::memory_order_relaxed);
 }
+
+void netSetStoragePressureProbe(bool (*probe)()) { storagePressureProbe = probe; }

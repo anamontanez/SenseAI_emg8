@@ -65,3 +65,6 @@ void netEnqueueImu(const ImuSample& s);
 
 uint32_t netPacketsSent();
 uint32_t netDropCount();
+
+/** Install before starting Wi-Fi. Sender yields while SD backlog is high. */
+void netSetStoragePressureProbe(bool (*probe)());

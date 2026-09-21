@@ -50,6 +50,24 @@ class SavedRecords(unittest.TestCase):
         self.assertEqual(result['sd_records'], [16, 16, 2])
         self.assertEqual(result['sd_absent_from_udp'], [0, 0, 0])
 
+    def test_phase_metadata_extension_and_corruption(self):
+        path = self.sd / 'M000.bin'
+        header = bytearray(path.read_bytes())
+        header[26] = 1
+        events = b''.join(struct.pack('<IHHI', *row) for row in
+                          [(0, 7, 3, 0x305), (200, 7, 3, 0x204), (300, 8, 4, 0x104)])
+        path.write_bytes(header + events)
+        master = self.check()['masters'][0]
+        self.assertEqual((master['event_count'], master['label_count']), (3, 1))
+        bad = bytearray(events)
+        bad[8] = 7
+        path.write_bytes(header + bad)
+        with self.assertRaisesRegex(AssertionError, 'Invalid phase'):
+            self.check()
+        path.write_bytes(header)
+        with self.assertRaisesRegex(AssertionError, 'Missing initial'):
+            self.check()
+
     def test_rate_metadata_matches_requested_capture(self):
         self.summary['rate'] = '1000'
         self.write_summary()

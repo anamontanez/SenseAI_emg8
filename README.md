@@ -194,6 +194,8 @@ The firmware emits a mix of:
 | `W1` | `W1` | Enable WiFi SoftAP + UDP streaming |
 | `W0` | `W0` | Disable WiFi (prints `#NET` stats) |
 | `U0` / `U1` | `U0` | Silence / restore UART output; command reception stays active |
+| `Pgrasp` / `Prest` / `Pdemo` | `Pgrasp\n` | Set session phase and notify the companion |
+| `P?` | `P?\n` | Query session phase |
 | `L<id>,<rep>` | `L7,3` | Set current grasp label and repetition |
 | `F` | `F` | List files on the SD card |
 | `G<path>` | `Gs_AABBCCDDEEFF_1713012345/R000.bin` | Transfer one file as raw binary |
@@ -224,7 +226,7 @@ the rate is lower; no values are duplicated or interpolated.
 After a long interruption the limiter discards accumulated catch-up credit.
 
 The 32-byte v4 master header uses previously reserved byte 25 for the rate:
-0 = max (including historical files), 1 = 1000 cap. Bytes 26-31 remain reserved.
+0 = max (including historical files), 1 = 1000 cap. Byte 26 announces the phase metadata extension (1); bytes 27-31 remain reserved.
 UDP and sample record layouts are unchanged.
 
 ### Bracelet → Host Responses
@@ -383,16 +385,19 @@ Each recording start within a session directory `s_<MAC>_<epoch>/` produces one 
 | 18 | 6 | Device MAC address |
 | 24 | 1 | Mode (`1`=All, `2`=Raw, `3`=Env, `4`=Sensor test) |
 | 25 | 1 | Rate selection: 0=max, 1=1000 Hz average cap |
-| 26 | 6 | Reserved |
+| 26 | 1 | Metadata extension: 0=historical labels, 1=phase/event kind |
+| 27 | 5 | Reserved |
 
-Label event (12 bytes, repeated for each `L<id>,<rep>` command received while recording):
+Metadata event (12 bytes, recording-start snapshot and each label/phase command received while recording):
 
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Timestamp (µs since recording start) |
 | 4 | 2 | Grasp/movement ID |
 | 6 | 2 | Repetition |
-| 8 | 4 | Reserved |
+| 8 | 1 | Phase: 04=grasp, 05=rest, 06=demo (extension 1) |
+| 9 | 1 | Event kind: 1=label, 2=phase, 3=start snapshot |
+| 10 | 2 | Reserved |
 
 **`R<nnn>.bin` / `E<nnn>.bin` — raw EMG / envelope: stream of 8-byte sample records, no header**
 
@@ -439,14 +444,17 @@ while retaining headers, status, counters, and reset diagnostics.
 ### Compile & Flash
 
 ```bash
-pio run -e esp32-s3-devkitc-1                    # normal build
-pio run -e esp32-s3-devkitc-1 -t upload          # normal flash
+pio run                                         # verified board: storage-bench
+pio run -t upload --upload-port COM9             # flash that default configuration
 pio device monitor -b 460800   # serial monitor (app UART runs at 460800, not the 115200 boot-log rate)
 ```
 
 The custom [partitions.csv](partitions.csv) provides a 3 MB app partition on
-the 8 MB flash. Keep build environments explicit: the normal image initializes
-SD and retains the original ready-pin map.
+the 8 MB flash. The default environment is now `esp32-s3-storage-bench`: real SD, combined
+I2C transfers and the physically verified ready mapping 15/42/41/40.
+The explicitly selected `esp32-s3-devkitc-1` environment retains the historical
+40/41/42/15 wiring and separate I2C path; it does not match this attached board.
+A status query prints `#CONFIG` with the actual I2C path and pin mapping.
 
 ### SD-free sampling benchmarks
 
@@ -456,9 +464,11 @@ SD and retains the original ready-pin map.
 | `esp32-s3-bench` | Separate, modern driver | Measured bench | On | Disabled |
 | `esp32-s3-legacy-bench` | Combined read then trigger | Measured bench | On | Disabled |
 | `esp32-s3-throughput-bench` | Combined read then trigger | Measured bench | Off | Disabled |
+| `esp32-s3-storage-bench` (default) | Combined read then trigger | Verified 15/42/41/40 | Boot routing probe | Enabled |
 
-The combined path uses the optional legacy I2C driver, which is deprecated
-upstream. It is a bench comparison, pending normal-deployment decisions.
+The combined path uses the ESP-IDF legacy I2C driver. It is now selected by
+the default storage environment for this verified board. The other environments
+remain explicit comparisons; match the physical ready wiring before use.
 Build it with `pio run -e esp32-s3-throughput-bench`; wait for the whole build
 to finish and verify the flashed image before measuring.
 
@@ -484,3 +494,18 @@ The libraries below are **vendored directly into [lib/](lib/)** as plain files (
 ## License
 
 Sense-AI
+
+## Companion synchronization and session phases
+
+See [the firmware-defined contract](docs/companion-protocol.md) for the exact
+monitor commands, companion UART bytes, SD metadata extension, and receiver
+changes needed in Ana's repository. Default phase is demo; send Prest/Pgrasp
+before starting a test, send transitions while recording, and Pdemo when
+leaving the session. Phase persists across pauses and mode changes.
+
+All companion UART writes now belong to a dedicated core-0 task (priority 6),
+above UDP (5). ADC workers and SD writing remain on core 1. Sync frames use
+an immutable recording epoch and are independent of CSV output and U0.
+Use U1 for command acknowledgements; U0 still mutes all PC UART output.
+One-way synchronization cannot establish precise cross-board alignment without
+receiver fixes and measurements. The receiver/monitor repositories are unchanged.

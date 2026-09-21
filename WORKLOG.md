@@ -1404,3 +1404,80 @@ remain pending. Monitor files were not modified.
 Final capped run NET: TX=1844 ERR=0 DROP=0. Final verification: test.txt
 hash unchanged, recording stopped, SD mounted, max selected, radio off,
 UART enabled, COM9 released. No push; unrelated .vscode edit preserved.
+
+## 2026-09-21 - Companion task and phase protocol in the new fork
+
+Work continues in D:/PhD/Code/SenseAI_emg8, branch feature/samping-speed,
+from Ana's 31ef79a. Monitor/auxiliary firmware reviewed read-only, not edited.
+User approved newline Pgrasp/Prest/Pdemo alongside L<id>,<rep>.
+
+Archived original COM9 application: benchmarks/sync-baseline/device-app.bin,
+embedded ELF dd3a7d2d07ff5f36f433ab3519f3705d24a6dcd33e7a96eba97a2677c74cfa9b.
+Descriptor reports 7e56da7, Sep 15; this does not prove source equivalence to
+the fork. Image contains original RDY array 40/41/42/15. Untouched fork normal
+build passes; archived fork-normal-firmware.bin/.elf.
+
+Original-device All/max baselines, 35 s each:
+- SD/radio off: ~463.7 Hz/raw, 129846 raw +6488 envelope +7001 IMU.
+- SD/UDP: ~447.6-448.4 Hz/raw, 125442 raw +6268 envelope +6990 IMU.
+Both save every ADC count reported by CNT, zero I2C errors/storage drops,
+one watchdog retrigger. UDP received every saved record without gaps.
+Existing card entries/sizes preserved. Artifacts: benchmarks/sync-baseline.
+
+Sync already ran core0 inside CSV task priority3. Main and CSV shared mutable
+int64 last-sync state with recording enabled before reset/start notification.
+Setting last-sync=0 did not force immediate sync before uptime30s.
+No evidence five bytes/30s explains halved throughput.
+
+Dedicated companion task owns UART1 TX on core0 priority6, above UDP5.
+Bounded queue serializes start/phase/stop; Start captures immutable epoch.
+Immediate sync, one early retry at1s, then30s intervals; pauses/mode boundaries
+cancel old schedule. ADC callbacks/SD never do companion UART I/O.
+LINK counters expose queue/TX failures; host ACK means local acceptance only.
+
+Pgrasp/Prest/Pdemo/P? implemented; phase defaults demo, persists across stops.
+SD master v4 byte26=1 announces metadata extension; unchanged12-byte event:
+reserved byte8=phase, byte9=kind (1 label,2 phase,3 initial snapshot).
+Timestamp0 snapshot retains pre-start labels/phase. Queue full rejects commands.
+Sample/IMU/UDP layouts unchanged. Bounded strict label parsing added.
+See docs/companion-protocol.md for monitor/Ana handoff.
+
+Receiver issues documented for Ana: start resets/flush can erase first sync,
+volatile64 clock state is not synchronized, active repeated-start does not
+establish new epoch, new phase bytes ignored, parser overflow/wrap handling.
+Early retry only mitigates current start flush. No cross-board accuracy claim.
+
+First normal test image ELF:
+307e8ecfd281416943e12b8320a6197af3bdcbea7be55c7254f9ed65a4370050.
+normal-phase-33 passes: CSV47.619Hz radiooff,0.999Hz radioon. U0 accepts label/
+phase commands. All seven metadata events and every acquired ADC count saved.
+LINK delta START1 STOP1 PHASE6 SYNC3 QERR0 TXERR0. Zero I2C errors,1 retrigger.
+Raw timestamp average468.74-468.76Hz across mixed radio conditions: relocation
+alone does not restore1000Hz on original mapping. Artifacts: benchmarks/sync-task.
+
+Compiler-only tests execute actual task with deterministic UART/RTOS stubs:
+frame ordering, first sync before uptime30s, pause/restart,32-bit wrap, TX
+timeout/short write and queue failure. No executable emitted.22 host tests pass.
+Both final configurations build. Storage diagnostic now probes actual ready
+routing before worker startup; CONFIG status identifies I2C path and pin map.
+
+Storage image 1e9be117f41b5c763530ba80c81384cbaad116c565bed81e053237e283570643:
+boot probe repeated three isolated conversions per ADC. Each consistently
+fell on its expected bit in 15/42/41/40; all I2C results0. This independently
+confirms actual wiring without waiting for the user's optional wiring reply.
+
+All/max SD+UDP35s recovered1028.6-1028.9Hz/raw but FAILED storage verification:
+321 raw records dropped from full SD queue; zero I2C errors/retriggers.
+NET TX3203 ERR728 (ENOMEM) DROP2280, ADC delivery99.1311%. The overflow occurred
+~4-5s after start, not at the31s sync. Kept failed capture for review.
+SD-only max35s then PASSED:1040.5-1040.6Hz/raw,291358 raw+14564 env+6997 IMU,
+all ADC counts saved, no errors/retriggers/drops. The comparison does not
+identify the card's exact internal latency mechanism.
+
+In response, reserved12000 rather than8000 raw records for SD; reduced UDP
+queues to1000raw/256env/100IMU. Net RAM cost about20KB. UDP sender now yields
+packet transmission at SD raw backlog>=3000, while still polling subscribers.
+No extra queue checks added to ADC callbacks. Added max SD write/sync-group
+latency counters to status. Further combined-load validation follows.
+Default PlatformIO environment now selects verified storage configuration,
+preventing accidental deployment of the mismatched historical default.

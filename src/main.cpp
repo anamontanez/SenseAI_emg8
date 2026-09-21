@@ -119,38 +119,6 @@ static constexpr gpio_num_t k5V_EN    = GPIO_NUM_14;  // 5V boost enable
 static constexpr gpio_num_t kCHG      = GPIO_NUM_5;   // Charge status (active LOW)
 static constexpr gpio_num_t kPGOOD    = GPIO_NUM_4;   // Power-good (active LOW)*/
 
-//UART communication electrode-user interface
-#define MEDICION_UART_PORT    UART_NUM_1
-#define MEDICION_UART_TX_PIN  GPIO_NUM_4
-#define MEDICION_UART_RX_PIN  GPIO_NUM_5
-#define MEDICION_UART_BAUD    115200
-#define MEDICION_UART_BUF     256
-
-// Byte sent to the measurement ESP (impedance, temperature, pressure) to signal "test finished" to close the current
-//recording and stop the sweep.
-#define TRIGGER_BYTE    0x01
-
-// Byte THIS side (bracelet) sends to the measurement ESP when it
-// starts a recording, regardless of the origin (PC/python command,
-// or the physical button.
-// this way the measurement ESP also starts its impedance sweep even
-// if the test is started from python without touching any button.
-
-#define START_TEST_BYTE 0x03
-
-// [SYNC] Byte this side sends periodically to the measurement ESP while a
-// recording is running, so it can keep its own timestamps aligned with
-// recordingTimestampUs() on this side. Followed by 4 bytes (uint32_t,
-// little-endian) carrying the current value of recordingTimestampUs() --
-// microseconds elapsed since THIS recording started, the same reference
-// already used by Sample/ImuSample. MUST match SYNC_BYTE in the
-// measurement ESP's firmware, and must not collide with TRIGGER_BYTE /
-// START_TEST_BYTE above.
-#define SYNC_BYTE            0x02
-#define SYNC_INTERVAL_MS     30000
-
-static const char* TAG = "MASTER";
-
 /* ── Channel layout (NOT identical on every ADC) ───────────────────────────── */
 
 /*
@@ -193,6 +161,7 @@ static constexpr uint16_t kIMU_ODR_HZ = 200;      // IMU polling rate
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
 
+#include "companion_link.hpp"
 #include "emg8_types.hpp"   // Sample / ImuSample / LabelEvent (shared with net_stream)
 #include <cstdarg>
 #include "net_stream.hpp"
@@ -275,7 +244,7 @@ static QueueHandle_t rawQ   = nullptr;         // raw EMG (ch 0,1)
 static QueueHandle_t envQ   = nullptr;         // envelope (ch 2,3)
 static QueueHandle_t imuQ   = nullptr;
 static QueueHandle_t labelQ = nullptr;         // LabelEvent from PC
-static constexpr int kRAW_QLEN  = 8000;        // ≈ 600 ms @ ~13 kSa/s
+static constexpr int kRAW_QLEN  = 12000;       // ~1.45 s at 8.3 kSa/s; SD buffering first
 static constexpr int kENV_QLEN  = 1000;        // ≈ 2 s   @ ~460 Sa/s
 static constexpr int kIMU_QLEN  = 400;         // ≈ 2 s   @ 200 Hz
 static constexpr int kLABEL_QLEN = 32;
@@ -293,94 +262,49 @@ static char macStr[13] = {};
 // Session directory path (set once at SD init)
 static std::string sessionDir;
 
-// [SYNC] Last esp_timer_get_time() (absolute, not relative to recStart) at
-// which a sync pulse was sent to the measurement ESP. 0 forces the first
-// pulse to go out immediately once a recording starts, instead of waiting
-// SYNC_INTERVAL_MS.
-static int64_t lastSyncSentUs = 0;
-
-// ─────────────────────────────────────────────
-//  UART initialization toward the measurement ESP
-// ─────────────────────────────────────────────
-static void measurementUartInit(void)
-{
-    uart_config_t cfg = {};
-    cfg.baud_rate           = MEDICION_UART_BAUD;
-    cfg.data_bits           = UART_DATA_8_BITS;
-    cfg.parity              = UART_PARITY_DISABLE;
-    cfg.stop_bits           = UART_STOP_BITS_1;
-    cfg.flow_ctrl           = UART_HW_FLOWCTRL_DISABLE;
-    cfg.source_clk          = UART_SCLK_DEFAULT;
-    cfg.rx_flow_ctrl_thresh = 0;
-
-    ESP_ERROR_CHECK(uart_driver_install(MEDICION_UART_PORT, MEDICION_UART_BUF, 0, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(MEDICION_UART_PORT, &cfg));
-    ESP_ERROR_CHECK(uart_set_pin(MEDICION_UART_PORT,
-                                 MEDICION_UART_TX_PIN,
-                                 MEDICION_UART_RX_PIN,
-                                 UART_PIN_NO_CHANGE,
-                                 UART_PIN_NO_CHANGE));
-
-    ESP_LOGI(TAG, "UART1 ready (TX=GPIO%d, RX=GPIO%d, %d baud)",
-             MEDICION_UART_TX_PIN, MEDICION_UART_RX_PIN, MEDICION_UART_BAUD);
-}
-
-// ─────────────────────────────────────────────
-//  Sends the trigger to the measurement ESP (fire-and-forget: the
-//  bracelet keeps recording without blocking while the measurement
-//  ESP works on its own).
-// ─────────────────────────────────────────────
-static void sendTrigger(void)
-{
-    uint8_t byte = TRIGGER_BYTE;
-    uart_write_bytes(MEDICION_UART_PORT, &byte, 1);
-    ESP_LOGI(TAG, "Trigger sent (0x%02X)", byte);
-}
-
-// ─────────────────────────────────────────────
-//  Tells the measurement ESP that THIS side (the bracelet) started a
-//  recording, so it also starts its impedance sweep if it's still
-//  idle. Sent every time a recording starts, regardless of the origin
-//  (PC/python, reed switch, or the bracelet's physical button) -- if
-//  the measurement ESP already started on its own (it shouldn't,
-//  since its own button was removed), the byte is simply discarded
-//  later as garbage (it's not TRIGGER_BYTE). Fire-and-forget, same as
-//  sendTrigger().
-// ─────────────────────────────────────────────
-static void sendStartToSlave(void)
-{
-    uint8_t byte = START_TEST_BYTE;
-    uart_write_bytes(MEDICION_UART_PORT, &byte, 1);
-    ESP_LOGI(TAG, "Test start notified to measurement ESP (0x%02X)", byte);
-}
+static SessionPhase currentPhase = SessionPhase::Demo; // control-task owned
 
 static uint32_t recordingTimestampUs() {
     return (uint32_t)(esp_timer_get_time() - recStart.load(std::memory_order_relaxed));
 }
 
-// ─────────────────────────────────────────────
-//  [SYNC] Sends a clock-sync pulse to the measurement ESP if
-//  SYNC_INTERVAL_MS has elapsed since the last one. Carries
-//  recordingTimestampUs() -- time elapsed since THIS recording started --
-//  so the measurement ESP's corrected timestamps land in the same
-//  reference frame as this side's own Sample/ImuSample timestamps.
-//  Fire-and-forget, same as sendTrigger()/sendStartToSlave(); called
-//  from uartTask(), which already runs at ~50 Hz while recording.
-// ─────────────────────────────────────────────
-static void sendSyncToSlaveIfDue(void)
-{
-    int64_t now = esp_timer_get_time();
-    if (now - lastSyncSentUs < (int64_t)SYNC_INTERVAL_MS * 1000) return;
-    lastSyncSentUs = now;
+static void sendStartToSlave() {
+    if (!companionStart(recStart.load(std::memory_order_relaxed), currentPhase))
+        printf("#ERR:LINK_QUEUE\n");
+}
 
-    uint32_t elapsedUs = recordingTimestampUs();
-    uint8_t pkt[5];
-    pkt[0] = SYNC_BYTE;
-    memcpy(&pkt[1], &elapsedUs, sizeof(elapsedUs));
-    uart_write_bytes(MEDICION_UART_PORT, (const char*)pkt, sizeof(pkt));
+static void stopCompanion(bool notify) {
+    if (!companionStop(notify)) printf("#ERR:LINK_QUEUE\n");
+}
+
+// Metadata extension 1: reserved low byte = phase, next byte = event kind.
+// Kind 1=label, 2=phase, 3=recording-start snapshot. Record size stays 12 bytes.
+static bool saveMetadata(uint8_t kind, SessionPhase phase, uint16_t grasp,
+                         uint16_t repetition, uint32_t timestamp) {
+    if (!recording || !sdOK) return true;
+    LabelEvent event{};
+    event.ts = timestamp;
+    event.grasp_id = grasp;
+    event.repetition = repetition;
+    event._reserved = static_cast<uint8_t>(phase) | (uint32_t(kind) << 8);
+    if (labelQ && xQueueSend(labelQ, &event, 0) == pdTRUE) return true;
+    printf("#ERR:METADATA_QUEUE\n");
+    return false;
+}
+
+static std::atomic<uint32_t> sdWriteMaxUs{0}, sdSyncMaxUs{0};
+static void trackIoTime(std::atomic<uint32_t>& maximum, int64_t start) {
+    uint32_t duration = static_cast<uint32_t>(esp_timer_get_time() - start);
+    uint32_t old = maximum.load(std::memory_order_relaxed);
+    while (duration > old && !maximum.compare_exchange_weak(old, duration,
+                                                            std::memory_order_relaxed)) {}
+}
+static bool storageNeedsPriority() {
+    return sdOK && rawQ && uxQueueMessagesWaiting(rawQ) >= kRAW_QLEN / 4;
 }
 
 static void resetDropCounters() {
+    sdWriteMaxUs = 0; sdSyncMaxUs = 0;
     rawDrops.store(0, std::memory_order_relaxed);
     envDrops.store(0, std::memory_order_relaxed);
     imuDrops.store(0, std::memory_order_relaxed);
@@ -426,6 +350,16 @@ static void updateStatusLed() {
     led->turnOn();
 }
 
+static void printBuildConfig() {
+#ifdef EMG8_LEGACY_I2C_BENCH
+    const char* i2c = "combined";
+#else
+    const char* i2c = "separate";
+#endif
+    printf("#CONFIG:I2C=%s,RDY=%d/%d/%d/%d,COMPANION_CORE=0\n",
+           i2c, (int)kRDY[0], (int)kRDY[1], (int)kRDY[2], (int)kRDY[3]);
+}
+
 static void printStatusLine() {
     uint16_t mv = 0;
     uint8_t pct = 0;
@@ -445,6 +379,11 @@ static void printStatusLine() {
            (unsigned long)rawDrops.load(std::memory_order_relaxed),
            (unsigned long)envDrops.load(std::memory_order_relaxed),
            (unsigned long)imuDrops.load(std::memory_order_relaxed));
+    printBuildConfig();
+    printf("#PHASE:%s\n", phaseName(currentPhase));
+    companionPrintStats();
+    printf("#SDIO:WRITE_MAX_US=%lu,SYNC_MAX_US=%lu\n",
+           (unsigned long)sdWriteMaxUs.load(), (unsigned long)sdSyncMaxUs.load());
     printf("#RATE:%s\n", limitFastRate1000 ? "1000" : "max");
 }
 
@@ -612,7 +551,7 @@ static bool sdOpenFiles(const std::string& base) {
     // Write master header (32 bytes, v4)
     // [0-3] "EMG8"  [4] ver=4  [5] nADC  [6] nCh  [7] div
     // [8-11] epoch_s(u32)  [12-13] bat_mV  [14] bat_%  [15] bat_state
-    // [16-17] imuODR(u16)  [18-23] MAC(6)  [24] mode  [25] rate cap  [26-31] reserved
+    // [16-17] imuODR(u16)  [18-23] MAC(6)  [24] mode  [25] rate cap  [26] metadata extension [27-31] reserved
     uint8_t hdr[32] = {};
     memcpy(hdr, "EMG8", 4);
     hdr[4] = 4;                  // version
@@ -635,6 +574,7 @@ static bool sdOpenFiles(const std::string& base) {
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     memcpy(hdr + 18, mac, 6);
     hdr[24] = (uint8_t)mode;
+    hdr[26] = 1;  // metadata extension: phase/event kind in LabelEvent::_reserved
     hdr[25] = recordingRate1000.load(std::memory_order_relaxed) ? 1 : 0;  // v4 reserved byte: 0=max, 1=1000 Hz cap
 
     filesOpen = true;
@@ -676,7 +616,10 @@ static void sdWriteTask(void*) {
                           FIL* file, const char* name, std::atomic<uint32_t>* drops) {
         int n = 0;
         while (n < capacity && xQueueReceive(queue, &buffer[n], 0) == pdTRUE) ++n;
-        if (n && !sdWriteChecked(file, name, buffer, n * sizeof(buffer[0]))) {
+        int64_t started = esp_timer_get_time();
+        bool ok = !n || sdWriteChecked(file, name, buffer, n * sizeof(buffer[0]));
+        if (n) trackIoTime(sdWriteMaxUs, started);
+        if (!ok) {
             // The failed batch is uncertain, even if some bytes were accepted.
             if (drops) drops->fetch_add(n, std::memory_order_relaxed);
             return -1;
@@ -731,10 +674,12 @@ static void sdWriteTask(void*) {
         if (!closing && dirty &&
             (TickType_t)(xTaskGetTickCount() - lastSync) >= pdMS_TO_TICKS(500)) {
             // Evaluate all files even when one fails.
+            int64_t syncStarted = esp_timer_get_time();
             bool ok = sdSyncChecked(&filRaw, "R");
             ok = sdSyncChecked(&filEnv, "E") && ok;
             ok = sdSyncChecked(&filImu, "I") && ok;
             ok = sdSyncChecked(&filMaster, "M") && ok;
+            trackIoTime(sdSyncMaxUs, syncStarted);
             lastSync = xTaskGetTickCount();
             dirty = false;
             if (!ok) {
@@ -781,11 +726,6 @@ static void uartTask(void*) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-
-        // [SYNC] Runs at the top of every iteration while recording (~50 Hz);
-        // internally no-ops unless SYNC_INTERVAL_MS has elapsed since the
-        // last pulse, so it doesn't add meaningful overhead to this loop.
-        sendSyncToSlaveIfDue();
 
         /* En modo UDP-solo no basta con que printf no escriba: armar la linea
          * cuesta 16 lecturas de ADC y una docena de snprintf 50 veces por
@@ -1129,6 +1069,7 @@ static bool startADCs() {
     if (err == ESP_OK) return true;
     commandAdcWorkers(kAdcStop);
     recording = false;
+    stopCompanion(true);
     waitImuIdle();
     commandSdWriter(SdCommand::Close);
     adcOK = false;
@@ -1208,8 +1149,8 @@ static bool startRecording() {
     if (sdOK) commandSdWriter(SdCommand::Open);
     recStart.store(esp_timer_get_time(), std::memory_order_relaxed);
     recording = true;
-    lastSyncSentUs = 0;  // [SYNC] force an immediate sync pulse for this new recording
-    sendStartToSlave();  // notify the measurement ESP (in case the start came from python/reed and not its own button)
+    sendStartToSlave();
+    saveMetadata(3, currentPhase, curGrasp, curRep, 0);
     if (!startADCs()) return false;
     updateStatusLed();
     printf("#REC\n");
@@ -1226,7 +1167,7 @@ static void stopRecordingCore(bool notifySlave = false) {
     recording = false;
     waitImuIdle();
     // Notify the companion at acquisition end, before potentially slow SD I/O.
-    if (notifySlave) sendTrigger();
+    stopCompanion(notifySlave);
     commandSdWriter(SdCommand::Close);
     printSampleCounts();
     // battery->disable5V();  // battery/5V management not used on this board (read on ESP32 #2 instead)
@@ -1235,7 +1176,7 @@ static void stopRecordingCore(bool notifySlave = false) {
 
 // ─────────────────────────────────────────────
 //  Controlled end of test: stops the recording and notifies the
-//  measurement ESP (sendTrigger) so it also closes its file. Used
+//  measurement ESP so it also closes its file. Used
 //  both for the PC's '0' command and for the physical backup/OR
 //  button (held 3s): if the PC/python crashes mid-test, the button
 //  lets you close everything in a controlled way instead of
@@ -1391,6 +1332,20 @@ static void checkStartButton() {
 static char uartLineBuf[128];
 static int  uartLinePos = 0;
 
+static bool parseLabel(const char* text, uint16_t& grasp, uint16_t& repetition) {
+    auto field = [&text](uint16_t& result) {
+        if (*text < '0' || *text > '9') return false;
+        uint32_t value = 0;
+        while (*text >= '0' && *text <= '9') {
+            value = value * 10 + uint32_t(*text++ - '0');
+            if (value > 65535) return false;
+        }
+        result = static_cast<uint16_t>(value);
+        return true;
+    };
+    return field(grasp) && *text++ == ',' && field(repetition) && *text == '\0';
+}
+
 /** Process a complete line command (after '\n'). */
 static void processUartLine(const char* line, int len) {
     if (len < 1) return;
@@ -1406,26 +1361,35 @@ static void processUartLine(const char* line, int len) {
             limitFastRate1000 = strcmp(line, "R1000") == 0;
             printf("#RATE:%s\n", limitFastRate1000 ? "1000" : "max");
         }
-    } else if (line[0] == 'L') {
-        // Label: L<grasp_id>,<rep>
-        int gid = 0, rep = 0;
-        if (sscanf(line + 1, "%d,%d", &gid, &rep) >= 1) {
-            curGrasp = (uint16_t)gid;
-            curRep   = (uint16_t)rep;
-            printf("#LABEL:%d,%d\n", gid, rep);
-            // Enqueue label event for SD master file
-            if (recording && sdOK.load(std::memory_order_relaxed) && labelQ) {
-                LabelEvent le = {};
-                le.ts = recordingTimestampUs();
-                le.grasp_id = (uint16_t)gid;
-                le.repetition = (uint16_t)rep;
-                xQueueSend(labelQ, &le, 0);
-            }
-            // Note: the trigger to the measurement ESP is NO LONGER
-            // sent here on a label transition (grasp->rest). It's now
-            // at the whole-test level: sent once when the '0' command
-            // (end of test) arrives -- see below.
+    } else if (line[0] == 'P') {
+        if (strcmp(line, "P?") == 0) {
+            printf("#PHASE:%s\n", phaseName(currentPhase));
+            return;
         }
+        SessionPhase next;
+        if (strcmp(line, "Pgrasp") == 0) next = SessionPhase::Grasp;
+        else if (strcmp(line, "Prest") == 0) next = SessionPhase::Rest;
+        else if (strcmp(line, "Pdemo") == 0) next = SessionPhase::Demo;
+        else { printf("#ERR:PHASE:USE_Pgrasp_Prest_OR_Pdemo\n"); return; }
+        // Main is the only producer; the SD consumer can only free more space.
+        if (recording && sdOK && (!labelQ || uxQueueSpacesAvailable(labelQ) == 0)) {
+            printf("#ERR:METADATA_QUEUE\n"); return;
+        }
+        uint32_t timestamp = recordingTimestampUs();
+        if (!companionPhase(next)) { printf("#ERR:LINK_QUEUE\n"); return; }
+        if (!saveMetadata(2, next, curGrasp, curRep, timestamp)) return;
+        currentPhase = next;
+        printf("#PHASE:%s\n", phaseName(currentPhase));
+    } else if (line[0] == 'L') {
+        uint16_t gid = 0, rep = 0;
+        if (!parseLabel(line + 1, gid, rep)) {
+            printf("#ERR:LABEL\n"); return;
+        }
+        if (!saveMetadata(1, currentPhase, (uint16_t)gid, (uint16_t)rep,
+                          recordingTimestampUs())) return;
+        curGrasp = (uint16_t)gid;
+        curRep = (uint16_t)rep;
+        printf("#LABEL:%d,%d\n", gid, rep);
     } else if (line[0] == 'G') {
         // File transfer: G<path as emitted by the 'F' listing>
         // El cuerpo del archivo sale por uart_write_bytes, que no pasa por
@@ -1479,7 +1443,7 @@ static void processUartLine(const char* line, int len) {
 
 /** Feed one byte to the UART line accumulator. Returns single-char cmds. */
 static int feedUartByte(uint8_t b) {
-    // Multi-byte commands start with 'L', 'G', 'R' and end with '\n'
+    // Multi-byte commands start with 'L', 'G', 'R', 'P' and end with '\n'
     if (uartLinePos > 0) {
         // We're accumulating a line
         if (b == '\n' || b == '\r') {
@@ -1494,7 +1458,7 @@ static int feedUartByte(uint8_t b) {
     }
 
     // First byte of a potential command
-    if (b == 'L' || b == 'G' || b == 'R') {
+    if (b == 'L' || b == 'G' || b == 'R' || b == 'P') {
         uartLineBuf[0] = (char)b;
         uartLinePos = 1;
         return 0;
@@ -1552,7 +1516,7 @@ static void listSDDir(const char* path) {
 /* ── app_main ──────────────────────────────────────────────────────────────── */
 
 
-#ifdef EMG8_ADC_TIMING
+#if defined(EMG8_ADC_TIMING) || defined(EMG8_NET_DIAGNOSTICS)
 // Bench-only routing test, before workers/ISR handlers start. Trigger one chip
 // at a time and observe ALL ready inputs without relying on kRDY's ADC mapping.
 static void probeReadyRouting() {
@@ -1634,7 +1598,8 @@ extern "C" void app_main() {
     gpio_set_pull_mode(GPIO_NUM_44, GPIO_PULLUP_ONLY);  // default ESP32-S3 U0RXD -- adjust if your board uses a different pin
 
     // UART1: toward the measurement ESP
-    measurementUartInit();
+    companionInit();
+    netSetStoragePressureProbe(storageNeedsPriority);
 
     /* ---- Device MAC → hex string ----------------------------------------- */
     {
@@ -1692,6 +1657,8 @@ extern "C" void app_main() {
 #ifdef EMG8_ADC_TIMING
     probeBusClock(i2c0, kSCL0, 0);
     probeBusClock(i2c1, kSCL1, 1);
+#endif
+#if defined(EMG8_ADC_TIMING) || defined(EMG8_NET_DIAGNOSTICS)
     probeReadyRouting();
 #endif
 
@@ -1914,8 +1881,8 @@ extern "C" void app_main() {
         if (sdOK) commandSdWriter(SdCommand::Open);
         recStart.store(esp_timer_get_time(), std::memory_order_relaxed);
         recording = true;
-        lastSyncSentUs = 0;  // [SYNC] force an immediate sync pulse for this new recording
-        sendStartToSlave();  // notify the measurement ESP (in case the start came from python/reed and not its own button)
+        sendStartToSlave();
+        saveMetadata(3, currentPhase, curGrasp, curRep, 0);
         updateStatusLed();
         printf("#REC\n");
     }

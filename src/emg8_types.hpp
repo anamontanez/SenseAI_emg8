@@ -27,11 +27,11 @@ struct __attribute__((packed)) ImuSample {
 };
 static_assert(sizeof(ImuSample) == 20, "ImuSample must be 20 bytes");
 
-/** @brief Label event written to master file when PC sends L command. */
+/** @brief Label/phase event written to master file (see docs/companion-protocol.md). */
 struct __attribute__((packed)) LabelEvent {
     uint32_t ts;           // µs since recStart
     uint16_t grasp_id;     // Ninapro movement number (0 = rest)
     uint16_t repetition;   // current repetition
-    uint32_t _reserved;    // pad to 12 bytes
+    uint32_t _reserved;    // extension 1: phase u8, event kind u8, zero u16
 };
 static_assert(sizeof(LabelEvent) == 12, "LabelEvent must be 12 bytes");
