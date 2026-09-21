@@ -4,6 +4,7 @@
  * @brief WiFi SoftAP + UDP full-rate sample streaming (see net_stream.hpp).
  ******************************************************************************/
 #include "net_stream.hpp"
+#include "pause_timing.hpp"
 
 #include <atomic>
 #include <cstring>
@@ -38,7 +39,7 @@ constexpr int kMaxImuRecs   = kMaxPayload / sizeof(ImuSample);  // 69
 constexpr uint32_t kFlushMs = 30;               // partial-batch latency bound
 
 // Queue sizes: sender drains every few ms, these only ride out WiFi hiccups
-constexpr int kRawQLen = 1000;   // ~120 ms; reserve RAM for primary SD stream
+constexpr int kRawQLen = 1500;   // 187.5 ms at 8 kSa/s; +4 KB, preserve Wi-Fi heap
 constexpr int kEnvQLen = 256;
 constexpr int kImuQLen = 100;
 
@@ -56,11 +57,41 @@ QueueHandle_t imuQ = nullptr;
 int sock = -1;
 sockaddr_in clientAddr = {};
 bool clientKnown = false;
-bool (*storagePressureProbe)() = nullptr;
+NetStoragePressure (*storagePressureProbe)() = nullptr;
 
 std::atomic<uint32_t> txPackets{0};
 std::atomic<uint32_t> dropCount{0};
-uint32_t txErrors = 0;
+std::atomic<uint32_t> txErrors{0};
+PauseTiming throttleTiming;
+PauseTiming pressureTiming; // Network-task owned; reset only while inactive.
+std::atomic<uint32_t> pressureCount{0}, pressureTotalMs{0}, pressureMaxMs{0};
+std::atomic<uint32_t> pressureCurrentMs{0}, sendMaxUs{0};
+std::atomic<uint32_t> throttleCount{0}, throttleTotalMs{0}, throttleMaxMs{0};
+std::atomic<uint32_t> rawQueueHigh{0}, envQueueHigh{0}, imuQueueHigh{0};
+
+// One writer (net task), atomic readers (control task). Sampled high-water
+// marks are lower bounds: queues can peak between these observations.
+void observeMaximum(std::atomic<uint32_t>& value, uint32_t sample) {
+    if (sample > value.load(std::memory_order_relaxed))
+        value.store(sample, std::memory_order_relaxed);
+}
+
+void observeNetwork(NetStoragePressure pressure) {
+    uint32_t now = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    pressureTiming.update(pressure == NetStoragePressure::Defer, now);
+    throttleTiming.update(pressure == NetStoragePressure::Throttle, now);
+    throttleCount.store(throttleTiming.count, std::memory_order_relaxed);
+    throttleTotalMs.store(throttleTiming.completedMs + throttleTiming.currentMs, std::memory_order_relaxed);
+    throttleMaxMs.store(throttleTiming.maxMs, std::memory_order_relaxed);
+    pressureCount.store(pressureTiming.count, std::memory_order_relaxed);
+    pressureTotalMs.store(pressureTiming.completedMs + pressureTiming.currentMs,
+                          std::memory_order_relaxed);
+    pressureMaxMs.store(pressureTiming.maxMs, std::memory_order_relaxed);
+    pressureCurrentMs.store(pressureTiming.currentMs, std::memory_order_relaxed);
+    if (rawQ) observeMaximum(rawQueueHigh, uxQueueMessagesWaiting(rawQ));
+    if (envQ) observeMaximum(envQueueHigh, uxQueueMessagesWaiting(envQ));
+    if (imuQ) observeMaximum(imuQueueHigh, uxQueueMessagesWaiting(imuQ));
+}
 #ifdef EMG8_NET_DIAGNOSTICS
 struct SendErrorCount { int code = 0; uint32_t count = 0; };
 SendErrorCount sendErrors[8];
@@ -110,11 +141,14 @@ void writeHeader(Batch& b, uint8_t type) {
 bool sendBatch(Batch& b, uint8_t type, size_t recSize) {
     writeHeader(b, type);
     if (clientKnown) {
+        int64_t sendStarted = esp_timer_get_time();
         int n = sendto(sock, b.buf, kHdrSize + b.count * recSize, 0,
                        (sockaddr*)&clientAddr, sizeof(clientAddr));
+        [[maybe_unused]] int sendErrno = n < 0 ? errno : 0;
+        observeMaximum(sendMaxUs, static_cast<uint32_t>(esp_timer_get_time() - sendStarted));
         if (n != kHdrSize + b.count * recSize) {
 #ifdef EMG8_NET_DIAGNOSTICS
-            countSendError(n < 0 ? errno : 0);  // Capture immediately, before logging.
+            countSendError(sendErrno);
 #endif
             txErrors++;
             // Keep this batch and sequence for the next pump. Queue capacity
@@ -131,17 +165,24 @@ bool sendBatch(Batch& b, uint8_t type, size_t recSize) {
     return true;
 }
 
-/** Drain queue into the batch; send when full or older than kFlushMs. */
+/** Send at most one packet per stream/pass to bound Wi-Fi catch-up bursts. */
 void pumpQueue(QueueHandle_t q, Batch& b, uint8_t type, size_t recSize,
                int maxRecs, uint32_t nowMs) {
     // A full batch may be waiting after a failed send. Retry it before
-    // removing any more records from the bounded queue.
-    if (b.count == maxRecs && !sendBatch(b, type, recSize)) return;
+    // removing any more records from the bounded queue. A success also ends
+    // this pass: raw capacity remains 174 records/5 ms versus ~40 arriving.
+    if (b.count == maxRecs) {
+        sendBatch(b, type, recSize);
+        return;
+    }
     while (b.count < maxRecs &&
            xQueueReceive(q, b.buf + kHdrSize + b.count * recSize, 0) == pdTRUE) {
         if (b.count == 0) b.firstMs = nowMs;
         b.count++;
-        if (b.count == maxRecs && !sendBatch(b, type, recSize)) return;
+        if (b.count == maxRecs) {
+            sendBatch(b, type, recSize);
+            return;
+        }
     }
     if (b.count > 0 && (nowMs - b.firstMs) >= kFlushMs) {
         sendBatch(b, type, recSize);
@@ -176,8 +217,10 @@ void netTask(void*) {
         if (!active.load(std::memory_order_acquire) || sock < 0) {
             // Only acknowledge after the previous poll/pump iteration ended.
             // The control task may then close/reset the socket and batches.
-            if (stopRequested.exchange(false, std::memory_order_acq_rel))
+            if (stopRequested.exchange(false, std::memory_order_acq_rel)) {
+                observeNetwork(NetStoragePressure::None);
                 xSemaphoreGive(stopped);
+            }
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
             continue;
         }
@@ -192,10 +235,11 @@ void netTask(void*) {
             printf("#UART:1,watchdog\n");
         }
 
-        // Keep subscription/quiet recovery responsive, but stop adding Wi-Fi
-        // work when primary storage needs to catch up. Queue overflow remains
-        // explicitly counted by the existing enqueue paths.
-        if (storagePressureProbe && storagePressureProbe()) {
+        // Keep control responsive. Moderate SD backlog reduces sender cadence;
+        // near-full storage suppresses TX completely to preserve SD priority.
+        NetStoragePressure pressure = storagePressureProbe ? storagePressureProbe() : NetStoragePressure::None;
+        observeNetwork(pressure);
+        if (pressure == NetStoragePressure::Defer) {
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
@@ -205,9 +249,9 @@ void netTask(void*) {
         pumpQueue(envQ, batches[kTypeEnv], kTypeEnv, sizeof(Sample), kMaxRawRecs, nowMs);
         pumpQueue(imuQ, batches[kTypeImu], kTypeImu, sizeof(ImuSample), kMaxImuRecs, nowMs);
 
-        // Raw fills a packet every ~19 ms in All mode; 5 ms keeps up with
-        // margin while letting the task sleep most of the time
-        vTaskDelay(pdMS_TO_TICKS(5));
+        // One raw packet per 10 ms still serves 17.4 krecords/s versus 8k
+        // arriving. Leave margin for send time and scheduling under pressure.
+        vTaskDelay(pdMS_TO_TICKS(pressure == NetStoragePressure::Throttle ? 10 : 5));
     }
 }
 
@@ -298,6 +342,11 @@ esp_err_t netStreamStart(const char* macStr) {
     txPackets.store(0);
     dropCount.store(0);
     txErrors = 0;
+    pressureTiming = {}; throttleTiming = {};
+    throttleCount = 0; throttleTotalMs = 0; throttleMaxMs = 0;
+    pressureCount = 0; pressureTotalMs = 0; pressureMaxMs = 0;
+    pressureCurrentMs = 0; sendMaxUs = 0;
+    rawQueueHigh = 0; envQueueHigh = 0; imuQueueHigh = 0;
 #ifdef EMG8_NET_DIAGNOSTICS
     for (auto& error : sendErrors) error = {};
 #endif
@@ -352,7 +401,7 @@ void netStreamStop() {
     lastClientMs = 0;
     printf("#NET:TX=%lu,ERR=%lu,DROP=%lu\n",
            (unsigned long)txPackets.load(),
-           (unsigned long)txErrors,
+           (unsigned long)txErrors.load(),
            (unsigned long)dropCount.load());
 }
 
@@ -383,4 +432,16 @@ uint32_t netDropCount() {
     return dropCount.load(std::memory_order_relaxed);
 }
 
-void netSetStoragePressureProbe(bool (*probe)()) { storagePressureProbe = probe; }
+void netSetStoragePressureProbe(NetStoragePressure (*probe)()) { storagePressureProbe = probe; }
+
+void netPrintDiagnostics() {
+    if (hostUartQuiet()) return;
+    printf("#NETDIAG:TX=%lu,ERR=%lu,DROP=%lu,PAUSES=%lu,PAUSE_MS=%lu,PAUSE_MAX_MS=%lu,PAUSE_NOW_MS=%lu,SEND_MAX_US=%lu,RAW_HI=%lu,ENV_HI=%lu,IMU_HI=%lu,THROTTLES=%lu,THROTTLE_MS=%lu,THROTTLE_MAX_MS=%lu\n",
+           (unsigned long)txPackets.load(), (unsigned long)txErrors.load(),
+           (unsigned long)dropCount.load(), (unsigned long)pressureCount.load(),
+           (unsigned long)pressureTotalMs.load(), (unsigned long)pressureMaxMs.load(),
+           (unsigned long)pressureCurrentMs.load(), (unsigned long)sendMaxUs.load(),
+           (unsigned long)rawQueueHigh.load(), (unsigned long)envQueueHigh.load(),
+           (unsigned long)imuQueueHigh.load(), (unsigned long)throttleCount.load(),
+           (unsigned long)throttleTotalMs.load(), (unsigned long)throttleMaxMs.load());
+}

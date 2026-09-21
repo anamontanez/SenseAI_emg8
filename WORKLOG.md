@@ -1546,3 +1546,115 @@ pauses or the previously observed capped-run SD drops. README updated.
 Validation: esp32-s3-storage-bench build passed (30.47 s); diff check
 passed. No new tests added for the startup-default change. Not flashed:
 the user is using the current firmware through the monitor.
+
+
+## 2026-09-21 - Direct UDP timing and runtime RAM investigation
+
+User released COM9 and authorized further tests after monitor-visible bursts.
+Monitor and auxiliary source remain unchanged. Passive comparison artifacts:
+benchmarks/monitor-live (MAX) and monitor-live-1000. The latter had zero new
+packet sequence gaps in its45-second window but raw backend frame intervals
+up to390ms. This is not proof of lossless original samples or sole causation
+by the rate cap. SD-pressure and network timing needed direct measurement.
+
+Added #MEM internal byte-addressable free/minimum/largest heap and #NETDIAG
+TX/errors/queue drops, SD-pressure pause count/total/current/max duration,
+sendto maximum duration and sampled UDP queue high-water marks. Network
+fields are atomic individual readings; queue maxima are lower bounds.
+Pause accounting is network-task owned and reset while inactive, after the
+stop acknowledgement. No additional per-sample instrumentation in ADC code.
+Details in docs/streaming-diagnostics.md. Tests compile actual pause logic
+and network task/pump bodies;26 host checks pass.
+
+Direct old-default baseline35s (1000Hz): zero reported SD drops/I2C errors/
+retriggers, UDP delivery99.6443%, NET ERR154 DROP334, sequence gaps4raw/1env/2IMU.
+Raw receive interval max331.750ms. Artifacts: benchmarks/udp-investigation.
+
+Diagnostic image ELF:
+ccf7f2d0cf881d6c46675adbaaadeb73fbba0503cbb3a370d015ca3f4f1cf019.
+60s at1000Hz, unchanged queues: UDP delivery99.6063%, NET ERR479 (ENOMEM),
+DROP1462, raw queue reached1000. Only one80ms SD-pressure deferral.
+Sendto max2580us; raw arrival max414.670ms. No reported SD drops/I2C errors/
+retriggers. Minimum internal heap16536 bytes, despite idle readings much
+higher. All raw acquisition rates999.925-1000.025Hz. IMU~124.6Hz (existing
+under-load shortfall remains, not attributable to receiver packet loss).
+Two earlier attempts ended before recording because Windows could not see
+the restarted AP. A fresh WlanScan restored the saved-profile connection.
+No Windows power settings changed. Test reconnection now retries five times.
+
+
+Buffer-only image ELF:
+fddf663cd2421af14217dcbd3b79c5e4db65cb6f7d7cfa1f9834dbf8944bf3e6.
+Raised UDP raw queue1000->1500 (+4000 bytes), leaving SD12000/env1000/IMU400
+and UDP env256/IMU100 unchanged. An8KB increase was considered before the
+full capture's lower heap minimum became available; chose4KB instead.
+60s test verified every acquired ADC count on SD:479984raw+23994env,
+7666IMU (~127.8Hz), initial metadata event present, original card entries/
+sizes preserved. Zero SD drops/I2C errors/retriggers. UART file transfer
+completed this time; this does not resolve its previous intermittent failure.
+UDP missed2193raw+16env records: raw9packet gaps (1566records) plus627 firmware
+queue drops; all received records matched SD. Delivery99.5617%.
+ERR255 ENOMEM; pressure4pauses totaling73ms, max34ms; sendto max2969us.
+Raw receive max416.585ms, minimum heap13964bytes. Extra buffering alone did
+not eliminate loss; separate runs have variable radio/card conditions.
+
+Next bounded sender change: one packet per stream per pass, retaining
+failed batches and30ms partial flush. Existing5ms delay/SD priority retained.
+This limits catch-up bursts rather than consuming more runtime heap.
+
+
+Bounded sender with original full-deferral policy, ELF:
+7425ad1a986c9c01913241b2e68a874fd7bc041b154279a172a07381b9badf8a.
+60s SD verification passed:479979raw+23993env+8829IMU (~147.2Hz),
+all acquired ADC counts match files and all UDP records match SD.
+UDP missing6054raw+67env: NET DROP5077, ERR348 ENOMEM,6raw packet gaps.
+Delivery98.7854%. A708587us SD sync coincided with a maximum804ms measured
+SD-pressure deferral, producing an819.872ms raw arrival gap. Total deferral
+808ms across2pauses; sendto max3989us. Minimum heap13152bytes.
+No SD drops/I2C errors/retriggers. The available RAM cannot buffer an
+additional0.8s of raw UDP data (~51KB payload). More RAM alone is insufficient.
+
+Revised pressure policy: SD raw backlog3000-8999 slows bounded sender passes
+from5ms to10ms (nominal17.4k raw records/s capacity versus8k arriving).
+At9000 (75% of12000), retain complete UDP deferral and recheck every5ms.
+Sampling and SD queues/tasks remain unchanged. THROTTLE diagnostic counters
+separate moderate pacing from urgent PAUSE time.27 host checks cover actual
+thresholds, both pressure paths, control responsiveness, stop acknowledgement,
+packet retry/budget/partial flush, timing wrap/reset and existing functionality.
+Final hardware validation follows; this policy is not a lossless-SD guarantee.
+
+
+Final two-level policy image ELF:
+2b8b674a305960b63d41ebb986f75a9134641c104dca15c841890e4d192c3175.
+Default storage environment built successfully; all 27 host checks passed.
+Static RAM is 68040 bytes (+88 from the prior firmware); UDP payload queue
+allocation increased by 4000 runtime bytes. SD allocations remain unchanged.
+
+Final 60-second All/1000 Hz SD+UDP test PASSED SD file verification:
+- Raw acquisition: 999.914-999.998 Hz per channel.
+- Saved 479990 raw, 23995 envelope and 6521 IMU records.
+- Every acquired ADC count matched SD; all received UDP records matched SD.
+- Zero SD drops, I2C errors, retriggers, UDP queue drops, malformed packets,
+  reordered packets or duplicate packets.
+- Three raw UDP packets were absent at the receiver: 522 raw samples, all
+  present on SD. ADC delivery 99.8964%. This is not lossless UDP.
+- NET: TX5570, ERR362 ENOMEM (retained/retried), DROP0; raw queue peak1305.
+- Moderate-pressure pacing: one 19 ms interval; no urgent full deferral.
+- Maximum sendto call3143us. Raw receive p99=155.657ms, max313.294ms.
+- Minimum internal heap21544 bytes; lowest queried largest block20480 bytes.
+- Maximum SD write213148us, sync384573us. File download completed correctly.
+- Original SD file names/sizes preserved. No files deleted or card formatting.
+
+The last test exercised only a short moderate-pressure interval; it did not
+repeat the earlier804ms full-deferral event under identical card conditions.
+Near-full deferral is covered by actual-code host checks, not hardware fault
+injection. Sequential runs vary in radio/card behavior, so do not attribute
+all observed improvement to one change or claim future lossless recording.
+IMU remains below its nominal200Hz under load (~108.7Hz in the final test);
+all received IMU samples matched SD. This separate scheduling shortfall and
+the earlier intermittent UART bulk-download failure remain unresolved.
+
+Final status verified: recording stopped, SD mounted, demo phase,1000 Hz,
+UART enabled; test cleanup had turned radio off. LINK start/stop1/1, sync3,
+QERR/TXERR0. COM9 closed and released. Latest firmware is already flashed.
+Monitor/auxiliary source unchanged; no push performed by this task.

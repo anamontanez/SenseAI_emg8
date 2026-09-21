@@ -193,6 +193,8 @@ def run(args):
             cmd = [sys.executable, '-B', str(Path(__file__).with_name('bench_acquisition.py')),
                    '--port', args.port, '--require-sd', '--condition', args.condition,
                    '--mode', str(args.mode), '--seconds', str(args.seconds), '--output', str(out/'capture')]
+            if args.status_interval:
+                cmd += ['--status-interval', str(args.status_interval)]
             if args.rate:
                 cmd += ['--rate', args.rate]
             if args.wifi_profile:
@@ -227,6 +229,7 @@ if __name__ == '__main__':
     ap.add_argument('--condition', choices=('off', 'udp', 'quiet'), default='udp')
     ap.add_argument('--mode', choices=(1, 2, 3, 4), type=int, default=1)
     ap.add_argument('--rate', choices=('max', '1000'))
+    ap.add_argument('--status-interval', type=float, default=0)
     ap.add_argument('--seconds', type=float, default=60)
     ap.add_argument('--wifi-profile')
     ap.add_argument('--output', required=True)

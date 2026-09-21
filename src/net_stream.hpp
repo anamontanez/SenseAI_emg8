@@ -66,5 +66,10 @@ void netEnqueueImu(const ImuSample& s);
 uint32_t netPacketsSent();
 uint32_t netDropCount();
 
-/** Install before starting Wi-Fi. Sender yields while SD backlog is high. */
-void netSetStoragePressureProbe(bool (*probe)());
+enum class NetStoragePressure { None, Throttle, Defer };
+
+/** Install before Wi-Fi. Moderate SD backlog slows TX; urgent backlog defers it. */
+void netSetStoragePressureProbe(NetStoragePressure (*probe)());
+
+/** Read-only cumulative diagnostics since Wi-Fi start; respects UART quiet. */
+void netPrintDiagnostics();

@@ -44,6 +44,7 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "esp_attr.h"     // IRAM_ATTR (button ISR)
 #include "driver/uart.h"
 #include "driver/gpio_filter.h"
@@ -299,8 +300,12 @@ static void trackIoTime(std::atomic<uint32_t>& maximum, int64_t start) {
     while (duration > old && !maximum.compare_exchange_weak(old, duration,
                                                             std::memory_order_relaxed)) {}
 }
-static bool storageNeedsPriority() {
-    return sdOK && rawQ && uxQueueMessagesWaiting(rawQ) >= kRAW_QLEN / 4;
+static NetStoragePressure storagePressure() {
+    if (!sdOK || !rawQ) return NetStoragePressure::None;
+    UBaseType_t pending = uxQueueMessagesWaiting(rawQ);
+    if (pending >= 3 * kRAW_QLEN / 4) return NetStoragePressure::Defer;
+    if (pending >= kRAW_QLEN / 4) return NetStoragePressure::Throttle;
+    return NetStoragePressure::None;
 }
 
 static void resetDropCounters() {
@@ -385,6 +390,12 @@ static void printStatusLine() {
     printf("#SDIO:WRITE_MAX_US=%lu,SYNC_MAX_US=%lu\n",
            (unsigned long)sdWriteMaxUs.load(), (unsigned long)sdSyncMaxUs.load());
     printf("#RATE:%s\n", limitFastRate1000 ? "1000" : "max");
+    netPrintDiagnostics();
+    constexpr uint32_t heapCaps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    printf("#MEM:FREE=%lu,MIN=%lu,LARGEST=%lu\n",
+           (unsigned long)heap_caps_get_free_size(heapCaps),
+           (unsigned long)heap_caps_get_minimum_free_size(heapCaps),
+           (unsigned long)heap_caps_get_largest_free_block(heapCaps));
 }
 
 /** Per-ADC/channel conversion counts for the recording that just ended —
@@ -1609,7 +1620,7 @@ extern "C" void app_main() {
 
     // UART1: toward the measurement ESP
     companionInit();
-    netSetStoragePressureProbe(storageNeedsPriority);
+    netSetStoragePressureProbe(storagePressure);
 
     /* ---- Device MAC → hex string ----------------------------------------- */
     {

@@ -108,9 +108,10 @@ the flashed path and mapping.
 
 SD raw buffering is 12000 records (~1.45 seconds at the measured max rate),
 with smaller UDP queues to reserve RAM for storage. When SD's raw backlog
-reaches 3000 records, the UDP sender pauses packet transmission until storage
-catches up; subscription and quiet-mode recovery remain responsive. Network
-queue overflow is counted and may increase during these pauses. Sampling and
+reaches 3000 records, the bounded UDP sender slows its passes from 5 to 10 ms.
+At 9000 records (75% capacity) it defers transmission until below that threshold;
+subscription and quiet-mode recovery remain responsive. Network queue overflow
+is counted and may increase during prolonged deferral. Sampling and
 SD enqueue do not wait for networking. This expresses the requested priority;
 a card stall longer than finite buffer capacity can still lose samples.
 

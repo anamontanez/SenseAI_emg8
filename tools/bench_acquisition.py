@@ -174,6 +174,7 @@ def run(args):
     stop_time = None
     counters = {}
     last_sub = 0.0
+    last_status_query = 0.0
     failure = None
     serial_file = (output / 'serial.jsonl').open('w', encoding='utf-8')
     udp_file = (output / 'udp.bin').open('wb')
@@ -184,7 +185,10 @@ def run(args):
         serial_file.flush()
 
     def poll():
-        nonlocal status, start_time, last_sub
+        nonlocal status, start_time, last_sub, last_status_query
+        if started and args.status_interval > 0 and time.perf_counter() - last_status_query >= args.status_interval:
+            send("?")
+            last_status_query = time.perf_counter()
         buf.extend(ser.read(ser.in_waiting or 1))
         while b'\n' in buf:
             line, _, rest = buf.partition(b'\n')
@@ -244,8 +248,17 @@ def run(args):
             wait(2)
         if args.condition in ('udp', 'quiet'):
             if args.wifi_profile:
-                subprocess.run(['netsh', 'wlan', 'connect', 'name=' + args.wifi_profile],
-                               check=True, timeout=10, capture_output=True)
+                # Windows can retain a stale scan after the AP restarts.
+                for attempt in range(5):
+                    reconnect = subprocess.run(
+                        ['netsh', 'wlan', 'connect', 'name=' + args.wifi_profile],
+                        timeout=10, capture_output=True)
+                    if reconnect.returncode == 0:
+                        break
+                    if attempt == 4:
+                        raise RuntimeError('Wi-Fi reconnect failed: ' +
+                                           reconnect.stdout.decode(errors='replace').strip())
+                    wait(2)
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
             sock.bind(('', 0))
@@ -328,6 +341,7 @@ if __name__ == '__main__':
     ap.add_argument('--mode', type=int, choices=(1, 2, 3, 4), default=1)
     ap.add_argument('--rate', choices=('max', '1000'), help='Select rate while stopped; omitted preserves legacy firmware compatibility')
     ap.add_argument('--require-sd', action='store_true', help='Explicitly test mounted SD; default still requires SD unavailable')
+    ap.add_argument('--status-interval', type=float, default=0, help='Query live firmware counters every N seconds; 0 disables')
     ap.add_argument('--seconds', type=float, default=60)
     ap.add_argument('--connect-wait', type=float, default=12)
     ap.add_argument('--wifi-profile', help='Reconnect this existing Windows Wi-Fi profile after W1')

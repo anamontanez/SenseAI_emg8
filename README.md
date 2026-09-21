@@ -103,7 +103,7 @@ Core 0                          Core 1
 ```
 
 - **ADC service tasks** (x2, core 1, one per I2C bus): each ALERT/RDY ISR timestamps a completion and posts its ADC index. The worker validates the ready event, reads the result, triggers the next single-shot conversion, then publishes the completed sample. It also owns start/stop and checks each ADC's recovery deadline even while its partner is active. Normal builds use separate `i2c_master` transfers; optional throughput builds combine read then trigger in a single legacy-driver command list.
-- **UDP sender** (core 0, priority 5): drains bounded raw/envelope/IMU queues and batches version-1 datagrams. Failed sends retain their batch for a later retry. Radio shutdown waits for the sender to finish its current iteration before closing its resources.
+- **UDP sender** (core 0, priority 5): drains bounded raw/envelope/IMU queues and batches version-1 datagrams, with at most one packet per stream per pass to limit catch-up bursts. Failed sends retain their batch for a later retry. Radio shutdown waits for the sender to finish its current iteration before closing its resources.
 - **SD writer** (core 1, priority 5): Drains the sample queues in batches (raw 500 × 8 B ≈ 4 KB). One file set (`R<nnn>.bin`, …) per recording start within the session directory.
 - **UART CSV** (core 0, priority 3): Prints latest readings at ~50 Hz with auto-adjusted column headers per mode, reduced to ~1 Hz while the radio is active.
 - **Main loop** (core 0): Monitors UART commands and reed switch for mode changes, start/stop, and pause/resume.
@@ -510,3 +510,6 @@ an immutable recording epoch and are independent of CSV output and U0.
 Use U1 for command acknowledgements; U0 still mutes all PC UART output.
 One-way synchronization cannot establish precise cross-board alignment without
 receiver fixes and measurements. The receiver/monitor repositories are unchanged.
+
+Live heap and UDP-pressure diagnostics are documented in
+[streaming-diagnostics.md](docs/streaming-diagnostics.md).

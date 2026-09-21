@@ -15,6 +15,7 @@ class NetworkPriority(unittest.TestCase):
         body = body.replace('while (true)', 'while (iterations < 2)')
         harness = r'''
 using uint32_t = unsigned;
+enum class NetStoragePressure { None, Throttle, Defer };
 namespace std { constexpr int memory_order_acquire=0, memory_order_acq_rel=0; }
 constexpr int pdTRUE=1;
 constexpr int pdMS_TO_TICKS(int ms) { return ms; }
@@ -26,9 +27,10 @@ struct Flag {
     constexpr bool exchange(bool next,int) { bool old=value; value=next; return old; }
 };
 struct Probe {
-    bool present=true, busy=true;
+    bool present=true;
+    NetStoragePressure level=NetStoragePressure::Defer;
     constexpr operator bool() const { return present; }
-    constexpr bool operator()() const { return busy; }
+    constexpr NetStoragePressure operator()() const { return level; }
 };
 #define CHECK(c) do { if (!(c)) return __LINE__; } while (0)
 struct Harness {
@@ -37,16 +39,18 @@ struct Harness {
     int sock=1, stopped=0, iterations=0, polls=0, pumps=0, acknowledgements=0;
     int rawQ=0, envQ=1, imuQ=2, batches[3]{};
     bool quiet=true;
+    int delaySum=0;
     uint32_t lastClientMs=1;
     static constexpr int kQuietWatchdogMs=20000, kTypeRaw=0, kTypeEnv=1, kTypeImu=2;
     static constexpr int kMaxRawRecs=174, kMaxImuRecs=69;
     constexpr long long esp_timer_get_time() { return 60000000; }
     constexpr void pollSubscribe() { ++polls; }
+    constexpr void observeNetwork(NetStoragePressure) {}
     constexpr bool hostUartQuiet() { return quiet; }
     constexpr void hostSetUartQuiet(bool next) { quiet=next; }
     constexpr void printf(const char*) {}
     constexpr void pumpQueue(int,int&,int,unsigned long long,int,uint32_t) { ++pumps; }
-    constexpr void vTaskDelay(int) { ++iterations; storagePressureProbe.busy=false; }
+    constexpr void vTaskDelay(int ms) { delaySum+=ms; ++iterations; storagePressureProbe.level=NetStoragePressure::None; }
     constexpr void ulTaskNotifyTake(int,int) { ++iterations; }
     constexpr void xSemaphoreGive(int) { ++acknowledgements; }
 '''
@@ -54,6 +58,10 @@ struct Harness {
     constexpr int run() {
         netTask(nullptr);
         CHECK(polls==2 && pumps==3 && !quiet); // only second iteration transmits
+        iterations=polls=pumps=delaySum=0;
+        storagePressureProbe.level=NetStoragePressure::Throttle;
+        netTask(nullptr);
+        CHECK(polls==2 && pumps==6 && delaySum==15); // 10 ms soft pressure, then 5 ms
         iterations=polls=pumps=0; storagePressureProbe.present=false;
         netTask(nullptr);
         CHECK(polls==2 && pumps==6); // no SD probe: normal network operation
@@ -70,6 +78,48 @@ static_assert(result==0, "Network priority regression; result identifies CHECK l
         self.assertIsNotNone(compiler)
         with tempfile.TemporaryDirectory() as folder:
             cpp=Path(folder)/'network.cpp'
+            cpp.write_text(harness+body+checks)
+            subprocess.run([compiler,'-std=c++17','-fsyntax-only',str(cpp)],check=True)
+
+
+    def test_actual_storage_thresholds_preserve_urgent_deferral(self):
+        root=Path(__file__).resolve().parents[1]
+        source=(root/'src/main.cpp').read_text(encoding='utf-8')
+        body=source.split('static NetStoragePressure storagePressure() {',1)[1].split('static void resetDropCounters',1)[0]
+        body='constexpr NetStoragePressure storagePressure() {'+body
+        harness=r"""
+using UBaseType_t=unsigned;
+enum class NetStoragePressure { None, Throttle, Defer };
+struct Harness {
+    bool sdOK=false;
+    int rawQ=1;
+    UBaseType_t pending=12000;
+    static constexpr unsigned kRAW_QLEN=12000;
+    constexpr UBaseType_t uxQueueMessagesWaiting(int) { return pending; }
+"""
+        checks=r"""
+    constexpr bool run() {
+        if (storagePressure()!=NetStoragePressure::None) return false;
+        sdOK=true; rawQ=0;
+        if (storagePressure()!=NetStoragePressure::None) return false;
+        rawQ=1; pending=2999;
+        if (storagePressure()!=NetStoragePressure::None) return false;
+        pending=3000;
+        if (storagePressure()!=NetStoragePressure::Throttle) return false;
+        pending=8999;
+        if (storagePressure()!=NetStoragePressure::Throttle) return false;
+        pending=9000;
+        if (storagePressure()!=NetStoragePressure::Defer) return false;
+        pending=12000;
+        return storagePressure()==NetStoragePressure::Defer;
+    }
+};
+static_assert([]{ Harness h; return h.run(); }(), "SD pressure thresholds");
+"""
+        compiler=shutil.which('clang++')
+        self.assertIsNotNone(compiler)
+        with tempfile.TemporaryDirectory() as folder:
+            cpp=Path(folder)/'thresholds.cpp'
             cpp.write_text(harness+body+checks)
             subprocess.run([compiler,'-std=c++17','-fsyntax-only',str(cpp)],check=True)
 

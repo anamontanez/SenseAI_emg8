@@ -136,3 +136,11 @@ this board and inspect CONFIG first. SDIO reports maximum write/sync-group
 duration, including scheduling delay. A completed capture is only a storage
 pass if every saved ADC count matches CNT and storage drops are zero.
 A high acquisition rate or good UDP reception alone is insufficient.
+
+
+Live network/heap investigation: pass --status-interval 2 to
+bench_acquisition.py or bench_sd.py to record #NETDIAG/#MEM alongside
+normal status. Zero (default) disables extra queries. A requested saved
+Wi-Fi profile is retried up to five times after an AP restart; a stale
+Windows scan may still require a fresh OS Wi-Fi scan before testing.
+Timing counters and their limits: ../docs/streaming-diagnostics.md.
