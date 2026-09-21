@@ -153,7 +153,7 @@ static inline bool isRawCh(uint8_t adcId, uint8_t ch) {
 // per-channel counts and zero retriggers/I2C errors — this is the validated
 // configuration, do not change it without re-checking #CNT.
 static constexpr uint8_t kSLOW_DIV = 20;
-static bool limitFastRate1000 = false;  // Main-owned; copied to workers at start.
+static bool limitFastRate1000 = true;   // Boot at 1000 Hz; copied to workers at start.
 static std::atomic<bool> recordingRate1000{false};  // SD header snapshot.
 static constexpr auto    kADC_RATE = ADS1015::ConfigRate::Rate_3300Hz;
 

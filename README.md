@@ -209,9 +209,10 @@ Command notes:
 
 ### Sampling rate selection
 
-Send `R1000\n` while stopped, then start normally with `1`, `2`, or `3`.
-Send `Rmax\n` to restore the existing unrestricted scheduler. `max` is the
-boot default; the setting lasts until reset. `R?\n` and the ordinary status
+The boot default is the average 1000 Hz ceiling. Start normally with `1`,
+`2`, or `3`. Send `Rmax\n` while stopped to select unrestricted speed, or
+`R1000\n` to restore the ceiling. The selection lasts until reset, which
+returns to 1000 Hz. `R?\n` and the ordinary status
 query report `#RATE:1000` or `#RATE:max`. Changing it during recording returns
 `#ERR:BUSY`; stop first. The monitor app has not been modified.
 

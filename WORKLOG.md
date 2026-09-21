@@ -1535,3 +1535,14 @@ max and status commands, but returned no serial response within 3 seconds;
 therefore final device state was not independently confirmed. COM9 is closed
 and released. No monitor or auxiliary source was modified; no SD files were
 deleted or card formatted. No git push performed by this task.
+
+## 2026-09-21 - Default to the 1000 Hz average ceiling
+
+User requested capped operation by default after observing UDP batching.
+Set the startup rate selection to 1000 Hz; Rmax remains available while
+stopped, and reset returns to 1000 Hz. Scheduler, sampling modes, storage,
+and UDP behavior are unchanged. This does not establish a fix for UDP
+pauses or the previously observed capped-run SD drops. README updated.
+Validation: esp32-s3-storage-bench build passed (30.47 s); diff check
+passed. No new tests added for the startup-default change. Not flashed:
+the user is using the current firmware through the monitor.
