@@ -113,3 +113,26 @@ UDP sender ERR counts failed send attempts. With batch retries enabled, ERR
 can increase while every acquired sample is eventually delivered. Use delivery
 fraction, sequence gaps and queue DROP together; ERR alone is not lost data.
 W0 intentionally discards pending data after the sender acknowledges shutdown.
+
+## Companion and phase validation
+
+Run `python tools/bench_companion.py --output benchmarks/<new-folder>` on an
+idle board with mounted SD and exclusive COM9 access. It creates a recording,
+exercises Pgrasp/Prest/Pdemo and labels (including while U0 mutes output),
+measures radio-off/on CSV rates, verifies LINK counters, downloads only the
+new files and checks exact SD metadata and acquired ADC counts. Existing
+entries must retain their names and sizes. It restores demo/label0 and W0.
+This validates bracelet scheduling/driver acceptance, not physical auxiliary
+reception or cross-board synchronization accuracy.
+
+`python -m unittest discover -s tools -p "test_*.py"` includes compiler-only
+checks of the actual companion task, bounded label parser, and UDP task's
+storage-priority branch. clang++ is required; no executable is emitted.
+The UDP test checks that high SD backlog suppresses TX while subscriber
+polling, quiet recovery, and shutdown acknowledgement remain functional.
+
+When testing throughput, use the verified default storage environment for
+this board and inspect CONFIG first. SDIO reports maximum write/sync-group
+duration, including scheduling delay. A completed capture is only a storage
+pass if every saved ADC count matches CNT and storage drops are zero.
+A high acquisition rate or good UDP reception alone is insufficient.

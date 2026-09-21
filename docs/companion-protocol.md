@@ -31,7 +31,8 @@ Host acknowledgement means accepted locally, not confirmed by the auxiliary boar
 
 ## Companion UART1
 
-Bracelet TX GPIO4 to auxiliary RX, bracelet RX GPIO5, common ground,
+Bracelet TX GPIO4 to auxiliary RX GPIO3, auxiliary TX GPIO6 to bracelet RX
+GPIO5, common ground,
 115200 baud, 8N1. One dedicated task on core 0 owns every write, with priority
 6, above the UDP sender (5). ADC workers and SD writer remain on core 1.
 No companion UART I/O runs inside an ADC callback or the SD writer.
@@ -53,7 +54,9 @@ reported; they must not stall acquisition or SD recording.
 
 ## Receiver findings for Ana
 
-Read-only review of `src/main_medicion.cpp` found these outstanding issues:
+Read-only review of `src/main_medicion.cpp` (SHA256
+`b9f6b23f93df3637f7d54ea387aa59c529b535367a4a11d3c78642b84d43c367`)
+found these outstanding issues:
 
 - The RX task applies sync relative to `t_inicio_prueba_us`, but the main loop
   later resets that epoch and `g_clockOffsetUs`, then flushes UART after opening
