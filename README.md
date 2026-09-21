@@ -513,3 +513,8 @@ receiver fixes and measurements. The receiver/monitor repositories are unchanged
 
 Live heap and UDP-pressure diagnostics are documented in
 [streaming-diagnostics.md](docs/streaming-diagnostics.md).
+
+Auxiliary impedance and pressure/temperature lines now relay from UART1 to
+PC UART0 in up-to-1-Hz batches while recording with U1. The existing EMG
+CSV/UDP formats are unchanged; see the companion contract for exact tags,
+buffering limits, and AUX diagnostics.

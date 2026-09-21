@@ -1658,3 +1658,68 @@ Final status verified: recording stopped, SD mounted, demo phase,1000 Hz,
 UART enabled; test cleanup had turned radio off. LINK start/stop1/1, sync3,
 QERR/TXERR0. COM9 closed and released. Latest firmware is already flashed.
 Monitor/auxiliary source unchanged; no push performed by this task.
+
+## 2026-09-21 - Auxiliary measurement UART relay
+
+User requested a read-only review of Ana's update and UART1-to-PC UART0
+forwarding without modifying her firmware or the monitor. Reviewed committed
+diff585cc5d..973534b (working diff only an existing sdkconfig change).
+Ana transmits imp:[frequency,impedance;...] after a complete sweep and
+p1:<kPa>,p2:<kPa>,temp:<C> after each sensor reading (2000ms during grasp).
+No measurement timestamp or checksum is transmitted.
+
+Implemented bounded RX in the existing core0 priority6 companion owner:
+1024-byte UART driver ring, error-event queue16, nonblocking512byte budget
+each <=10ms under normal scheduling. Due commands and sync retain precedence.
+A4096byte SPSC ring publishes only complete known-tag lines, limit3078chars,
+and rejects/drop-counts malformed, oversized, overflowed messages. Wire errors
+flush and discard through LF. No large parser/snapshot copies or added task.
+Existing core0 priority3 UART preview forwards unchanged complete lines in
+up-to1Hz batches while recording/U1. Stopped/U0 discards pending complete
+lines. ADC/SD priorities, queues, CSV columns, UDP layout remain unchanged.
+AUX status counters expose RX/TX/BAD/DROP/MUTED/UARTERR. File downloads now
+lock stdout across header/binary/body/end against printf-based preview lines.
+
+Build storage-bench successful (full340.52s rebuild). Static RAM72200bytes,
+flash933238bytes. Static RAM grew4160bytes; UART runtime allocation also grew
+by768bytes plus the16-entry event queue/driver bookkeeping. No PSRAM assumed.
+ELF SHA256 e9e7924c2ad0553dd87fbec8faab9f634ab7c463f832d170aed10c7dca0601fe
+BIN SHA256 1433c64e3f61e84562ac5c160dc997fba9abb55754a86fdbc76f43ff08671060
+Flashed app at0x10000 on COM9, esptool hash verified. Host suite28checks PASS,
+including actual companion TX ordering after RX integration and production
+ring fragmentation/CRLF, maximum-length lines, consumer snapshot boundaries,
+wraparound, pinned-view overflow protection, rejection and LF recovery.
+
+Physical auxiliary connected: 30s recording with grasp/rest/grasp transitions.
+Received/forwarded2impedance sweeps and9sensor messages; RX=TX=11, all AUX
+error/drop/muted counters zero. Sweeps1953/1965characters with99numeric pairs,
+2kHz..100kHz, both closing brackets intact. Per-channel raw counts29985..29992
+over~30s (~1000Hz); I2Cerrors/retriggers/SDqueue drops zero. This smoke run
+did not download its SD files. Analog accuracy and auxiliary clock alignment
+are not established by this transport test. Artifacts: benchmarks/aux-relay.
+Combined SD+UDP acquisition/readback validation follows.
+
+Combined35s All/1000Hz SD+UDP validation:
+- Received one1965character99point sweep and one pressure/temperature line;
+  cumulative AUX RX=TX=13, BAD/DROP/MUTED/UARTERR=0 across both physical tests.
+- Raw device-timestamp rates1000.012..1000.213Hz; complete10s windows
+  999.9..1000.1Hz. No I2C errors, retriggers, or SD/UDP queue drops.
+- All UDP streams had zero packet gaps/reordering/duplicates/invalid records.
+  NET TX3274, ERR78 (retried), DROP0; raw queue peak607. One99ms moderate
+  SD-pressure interval, no urgent pauses; sendto max3896us.
+- Internal heap minimum18468bytes; final FREE48720,LARGEST31744.
+  SD maxwrite251918us, sync56084us. IMU~131.2Hz; previous under-load IMU
+  rate shortfall remains, unrelated to claiming success for this relay.
+- Initial raw-file UART download timed out short; the known intermittent
+  large-download issue persists. Read-only retry of the same raw file passed.
+  Verification using that retry: SD280088raw +14000env +4585IMU;
+  EVERY acquired ADC count matched SD, and all received UDP records matched
+  SD byte-for-byte, with zero records missing in either direction. Master
+  metadata passed. Existing card entries/sizes preserved; no files deleted.
+- First failed transfer retained separately; see sd-udp-35/summary.json and
+  retry-summary.json for both outcomes. This short run does not prove future
+  lossless radio/card behavior or accurate auxiliary timestamps/analog values.
+
+Final28host tests passed and git diff --check passed. Monitor and Ana source
+unchanged (Ana retains her pre-existing sdkconfig modification). Current
+firmware remains flashed; no push performed.

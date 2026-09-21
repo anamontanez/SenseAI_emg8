@@ -76,7 +76,8 @@ struct Harness {
 '''
         core = core.replace('QueueHandle_t events = nullptr', 'QueueHandle_t events = 1')
         harness = r'''
-    int step = 0, used = 0, sends = 0, pos = 0;
+    int step = 0, used = 0, sends = 0, pos = 0, receives = 0;
+    constexpr void companionReceive() { ++receives; }
     int64_t now = 10;
     uint8_t wire[100]{};
     bool failWait = false, failWrite = false, failQueue = false;
@@ -93,7 +94,7 @@ struct Harness {
     constexpr int xQueueReceive(int, Event* e, unsigned wait) {
         switch (step++) {
         case 0:
-            if (wait != portMAX_DELAY) return 0;
+            if (wait != 10) return 0;
             now=10; *e={Kind::Start,SessionPhase::Grasp,false,10}; return 1;
         case 1: now=1000010; return 0;
         case 2: now=1000020; *e={Kind::Phase,SessionPhase::Rest,false,0}; return 1;
@@ -123,7 +124,7 @@ struct Harness {
         CHECK(sync(1000000) && sync(31000000) && byte(1));
         CHECK(byte(3) && byte(4) && sync(0));
         CHECK(sync(1234) && byte(1)); // uint32 wire clock wraps, no sign extension
-        CHECK(pos == used && used == 44);
+        CHECK(pos == used && used == 44 && receives == 12);
         CHECK(starts.value==3 && stops.value==2 && phases.value==4 && syncs.value==7);
         CHECK(queueErrors.value==0 && txErrors.value==0);
         failWait=true; sendSync(now);

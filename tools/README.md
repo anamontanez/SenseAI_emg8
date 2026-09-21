@@ -144,3 +144,17 @@ normal status. Zero (default) disables extra queries. A requested saved
 Wi-Fi profile is retried up to five times after an AP restart; a stale
 Windows scan may still require a fresh OS Wi-Fi scan before testing.
 Timing counters and their limits: ../docs/streaming-diagnostics.md.
+
+### Auxiliary UART relay checks
+
+`test_companion_rx.py` compiles the production bounded-buffer implementation
+with deterministic cursors: fragmented input, CRLF, snapshot boundaries,
+wraparound, a maximum-length sweep, overflow while a consumer holds a view,
+and recovery after malformed/oversized input or a wire error. The existing
+companion task test also checks RX service without changing TX frame order.
+
+Physical relay captures for the 2026-09-21 implementation are under
+`benchmarks/aux-relay/` (ignored local artifacts). See WORKLOG for the exact
+flashed image and validation limits. Parse `imp:[...]` and
+`p1:...,p2:...,temp:...` as independent UART lines; their arrival timestamps
+are host observations, not auxiliary acquisition timestamps.

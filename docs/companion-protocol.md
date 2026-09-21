@@ -52,11 +52,11 @@ boundaries cancel the old synchronization schedule. Explicit end-test sends
 epoch in the ordered control queue. Queue/transmit errors are counted and
 reported; they must not stall acquisition or SD recording.
 
-## Receiver findings for Ana
+## Historical receiver findings for Ana
 
 Read-only review of `src/main_medicion.cpp` (SHA256
 `b9f6b23f93df3637f7d54ea387aa59c529b535367a4a11d3c78642b84d43c367`)
-found these outstanding issues:
+found these issues at that historical revision:
 
 - The RX task applies sync relative to `t_inicio_prueba_us`, but the main loop
   later resets that epoch and `g_clockOffsetUs`, then flushes UART after opening
@@ -67,7 +67,8 @@ found these outstanding issues:
   Publish the epoch/offset together under a short lock or an atomic snapshot.
 - The RX handler reads at most 32 bytes for each event and ignores UART overflow
   and frame errors. Drain available bytes and reset incomplete framing on errors.
-- Bytes `04`/`05`/`06` are currently ignored; Ana must implement their handling.
+- That revision ignored bytes `04`/`05`/`06`. Ana has since implemented
+  them (reviewed at `973534b`); this item is superseded.
 - One-way software timestamps include UART serialization (~434 microseconds
   for five bytes at 115200 baud) and RX scheduling latency. Offset replacement
   can make corrected time jump backward; it also misinterprets 32-bit wrap.
@@ -142,3 +143,59 @@ Do not treat successful short runs as a lossless-recording guarantee.
 Final-image phase hardware retesting was not completed; the earlier
 phase test and 24 host tests passed. Auxiliary receipt/clock accuracy
 remain unverified. Detailed counts and artifacts are in WORKLOG.md.
+
+## Auxiliary measurements forwarded to the monitor (2026-09-21)
+
+Reviewed Ana's committed diff `585cc5d..973534b` in
+`Electromyographic-interaction-variables/src/main_medicion.cpp`. Her UART2
+now sends ASCII, LF-terminated messages at 115200 baud:
+
+```text
+imp:[1000.0,1234.56;2000.0,1200.12]
+p1:1.25,p2:2.50,temp:30.75
+```
+
+Each impedance pair is frequency in Hz and magnitude in ohms. Pressure is
+kPa and temperature is degrees Celsius. The bracelet forwards the complete
+line with the same spelling, numeric text and point order to PC UART0 at
+460800 baud. These are separate lines; H/D CSV columns and UDP packets do
+not change. The monitor must recognize `imp:[` and `p1:` before its CSV
+handling. Keep UART reception connected and use `U1`, including with UDP on.
+
+While recording, pending auxiliary lines are emitted in batches at most
+once per second, independent of the EMG CSV divider. Lines are sent once;
+there is no repeated stale snapshot. Ana sends pressure/temperature every
+2000 ms during grasp, and a sweep on start/rest; 1 Hz forwarding does not
+create new measurements. No auxiliary timestamps, labels, sequence numbers,
+or checksums exist in this wire format. Laptop arrival time is NOT the
+sensor acquisition timestamp and cannot establish clock alignment.
+This change relays live values only; it does not add auxiliary records
+to bracelet SD files. Ana's controller retains its own SD logging.
+
+Core-0 companion task (priority 6) retains sole ownership of UART1 TX/sync
+and now drains RX nonblocking every <=10 ms under normal scheduling, with
+a 512-byte work budget per pass and a 1024-byte driver RX buffer. Commands
+still wake it immediately; RX processing follows due commands/syncs.
+A 4096-byte single-producer/single-consumer buffer publishes only complete
+recognized lines (maximum 3078 characters excluding LF). The existing
+core-0 UART preview task (priority 3) forwards a fixed snapshot of pending
+lines, without copying a whole sweep or blocking the companion owner.
+ADC/SD workers, queues and priorities remain unchanged.
+
+Oversized/unrecognized lines are rejected; buffer exhaustion drops the
+incoming line without blocking. UART overflow/framing errors flush pending
+driver bytes and discard through the next LF. LF and CRLF are accepted.
+Validation checks framing/tags, not numerical plausibility; without a
+checksum undetected corruption remains possible. Finite buffering is not
+a lossless-delivery guarantee.
+
+`U0` and stopped recording suppress forwarding and discard completed
+pending lines. Resume with `U1` while recording for new live measurements.
+Do not expect stop-time or quiet-period measurements to be replayed. SD
+binary downloads hold the stdout stream lock through FDATA/body/FDONE so
+auxiliary/preview printf output cannot enter the binary payload.
+
+Status `?` adds `#AUX:RX=...,TX=...,BAD=...,DROP=...,MUTED=...,UARTERR=...`:
+counts since boot of accepted lines, complete host writes, rejected lines,
+buffer/host-write losses, lines discarded while quiet/stopped, and observed
+UART error events. TX means accepted by host output, not monitor acknowledgement.

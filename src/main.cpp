@@ -163,6 +163,7 @@ static constexpr uint16_t kIMU_ODR_HZ = 200;      // IMU polling rate
 /* ── Types ─────────────────────────────────────────────────────────────────── */
 
 #include "companion_link.hpp"
+#include "companion_rx.hpp"
 #include "emg8_types.hpp"   // Sample / ImuSample / LabelEvent (shared with net_stream)
 #include <cstdarg>
 #include "net_stream.hpp"
@@ -742,6 +743,9 @@ static void uartTask(void*) {
     uint8_t lastHdrSensor = 0xFF;
 
     while (true) {
+        // Independent 1 Hz auxiliary batches; unchanged EMG CSV/UDP formats.
+        // Stopped/quiet previews discard queued lines, including during G.
+        companionForward(recording.load(std::memory_order_relaxed));
         if (!recording) {
             hdrDone = false;
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -1448,6 +1452,8 @@ static void processUartLine(const char* line, int len) {
             printf("#ERR:OPEN_FAIL:%d,%s\n", (int)fr, fpath.c_str());
             return;
         }
+        // Keep every printf-based preview/status line outside the binary body.
+        flockfile(stdout);
         uint32_t sz = f_size(&tf);
         printf("#FDATA:%s,%u\n", fpath.c_str(), (unsigned)sz);
 
@@ -1459,6 +1465,7 @@ static void processUartLine(const char* line, int len) {
         }
         f_close(&tf);
         printf("\n#FDONE\n");
+        funlockfile(stdout);
     }
 }
 

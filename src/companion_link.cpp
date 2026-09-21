@@ -1,4 +1,5 @@
 #include "companion_link.hpp"
+#include "companion_rx.hpp"
 #include "net_stream.hpp"
 #include <atomic>
 #include <cstdio>
@@ -8,6 +9,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+
+extern QueueHandle_t companionRxEvents;
 
 namespace {
 constexpr uart_port_t kPort = UART_NUM_1;
@@ -51,11 +54,15 @@ void linkTask(void*) {
     bool active = false;
     int64_t epoch = 0, deadline = 0;
     while (true) {
-        TickType_t wait = portMAX_DELAY;
+        // At 115200 baud a 1024-byte RX ring holds ~89 ms. Drain every 10 ms,
+        // even between recordings/syncs; control events still wake immediately.
+        const TickType_t rxWait = pdMS_TO_TICKS(10) ? pdMS_TO_TICKS(10) : 1;
+        TickType_t wait = rxWait;
         if (active) {
             int64_t remaining = deadline - esp_timer_get_time();
             wait = remaining <= 0 ? 0 : pdMS_TO_TICKS((remaining + 999) / 1000);
             if (remaining > 0 && wait == 0) wait = 1;
+            if (wait > rxWait) wait = rxWait;
         }
         Event event{};
         if (xQueueReceive(events, &event, wait) == pdTRUE) {
@@ -85,6 +92,7 @@ void linkTask(void*) {
             sendSync(epoch);
             deadline = esp_timer_get_time() + kPeriodUs;
         }
+        companionReceive();
     }
 }
 
@@ -112,7 +120,7 @@ void companionInit() {
     cfg.stop_bits = UART_STOP_BITS_1;
     cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
     cfg.source_clk = UART_SCLK_DEFAULT;
-    ESP_ERROR_CHECK(uart_driver_install(kPort, 256, 0, 0, nullptr, 0));
+    ESP_ERROR_CHECK(uart_driver_install(kPort, 1024, 0, 16, &companionRxEvents, 0));
     ESP_ERROR_CHECK(uart_param_config(kPort, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(kPort, GPIO_NUM_4, GPIO_NUM_5,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
@@ -138,4 +146,5 @@ void companionPrintStats() {
            (unsigned long)starts.load(), (unsigned long)stops.load(),
            (unsigned long)phases.load(), (unsigned long)syncs.load(),
            (unsigned long)queueErrors.load(), (unsigned long)txErrors.load());
+    companionRxPrintStats();
 }
