@@ -616,7 +616,7 @@ static void sdWriteTask(void*) {
                           FIL* file, const char* name, std::atomic<uint32_t>* drops) {
         int n = 0;
         while (n < capacity && xQueueReceive(queue, &buffer[n], 0) == pdTRUE) ++n;
-        int64_t started = esp_timer_get_time();
+        int64_t started = n ? esp_timer_get_time() : 0;
         bool ok = !n || sdWriteChecked(file, name, buffer, n * sizeof(buffer[0]));
         if (n) trackIoTime(sdWriteMaxUs, started);
         if (!ok) {
@@ -688,7 +688,17 @@ static void sdWriteTask(void*) {
                 continue;
             }
         }
-        if (!hadData) vTaskDelay(pdMS_TO_TICKS(20));
+        if (!hadData) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        } else if (!closing && uxQueueMessagesWaiting(rawQ) < 500 &&
+                   uxQueueMessagesWaiting(envQ) < 100 &&
+                   uxQueueMessagesWaiting(imuQ) < 50 &&
+                   uxQueueMessagesWaiting(labelQ) < 8) {
+            // Continuous tiny batches can keep this priority-5 task runnable
+            // forever and starve the priority-4 IMU. With no significant
+            // backlog, block for one tick; ADC workers still preempt us.
+            vTaskDelay(1);
+        }
     }
 }
 

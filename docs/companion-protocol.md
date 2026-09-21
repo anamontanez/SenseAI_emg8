@@ -117,3 +117,27 @@ a card stall longer than finite buffer capacity can still lose samples.
 SDIO status reports the longest write and sync group durations observed in the
 current recording, including time preempted by other work. These counters are
 diagnostics, not a guarantee of card durability or future maximum latency.
+
+When storage queues are low, the writer blocks for one scheduler tick between
+productive passes so it cannot monopolize core 1 with tiny writes and starve
+the IMU. It drains continuously while backlog is high and while closing.
+
+Host file-download implementations should provide sufficient serial RX
+buffering. A multi-megabyte 460800-baud download on Windows lost 384 bytes with
+the small default host buffer during this review. The test tool requests a
+1 MiB RX buffer and verifies downloaded records/counts; the monitor is unchanged.
+The existing G protocol has no CRC/retransmission, so this is not a guarantee
+against all transport corruption.
+
+
+### Final validation limits (2026-09-21)
+
+The final image saved every acquired ADC sample in a 60-second SD+UDP max
+run (~1021 Hz/raw channel, ~198 Hz IMU). A subsequent 35-second 1000 Hz
+run reported 200 raw SD queue drops and ~146 Hz IMU, and its UART file
+download timed out with missing #FDONE even with the 1 MiB RX buffer.
+Storage under combined load and bulk UART downloads remain unresolved.
+Do not treat successful short runs as a lossless-recording guarantee.
+Final-image phase hardware retesting was not completed; the earlier
+phase test and 24 host tests passed. Auxiliary receipt/clock accuracy
+remain unverified. Detailed counts and artifacts are in WORKLOG.md.

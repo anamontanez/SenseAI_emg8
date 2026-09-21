@@ -1481,3 +1481,57 @@ No extra queue checks added to ADC callbacks. Added max SD write/sync-group
 latency counters to status. Further combined-load validation follows.
 Default PlatformIO environment now selects verified storage configuration,
 preventing accidental deployment of the mismatched historical default.
+
+Storage-priority image ELF39d93a9bd4471ba73cd6e8255ca017b975be1b8db40dd3212995b7a02425fca0:
+60-second max SD+UDP capture reached1022.18-1022.31Hz/raw, zero ADC errors,
+retriggers or reported storage drops. NET TX5543 ERR237 DROP0; ADC reception
+99.8987%. Longest measured write197097us, sync group48764us.
+However IMU saved only8884 samples (~148Hz), with long gaps/catch-up bursts.
+The writer's continuous tiny batches can keep priority5 runnable indefinitely,
+starving IMU priority4. Added one-tick blocking only when all queues are low
+and not closing; a high backlog still drains without that pause. Avoided timing
+calls for empty write batches. This needs fresh hardware verification.
+
+First R000 download was corrupted: FDONE appeared384 bytes before its expected
+position and health lines filled the requested byte count. Device stayed idle,
+mounted and responsive. Enlarged the Windows host-test RX buffer to1MiB and
+retrying the unchanged file into sd-retry; original failed download preserved.
+This is separate from the earlier321-record SD queue overflow.
+
+## Final handoff - 2026-09-21
+
+Final flashed ELF:
+4c76ce4444b9c5fa07075a3ea3f30bbfb45985442197ee6a82991a3f8244205f.
+Both PlatformIO environments build; all 24 host tests pass.
+Artifacts: benchmarks/companion-final (firmware, logs, captures).
+The earlier unchanged-file retry passed after increasing the host RX buffer.
+
+Final-image All/max SD+UDP, 60 seconds: PASS storage verification.
+Raw channels averaged 1021.024-1021.207 Hz; 490148 raw, 24504 envelope,
+11888 IMU records saved (~198.1 Hz IMU). Every acquired ADC count matched
+SD, with zero reported SD drops, I2C errors or retriggers.
+UDP ADC delivery was 99.2774%; NET TX5670 ERR749 DROP2469.
+Maximum measured SD write 199208 us, sync group 353301 us.
+
+Final-image All/1000 SD+UDP, 35 seconds: FAILED.
+Raw channels averaged 1000.211-1000.383 Hz; zero I2C errors/retriggers.
+Device reported 200 raw SD queue drops. File size corresponds to 279889
+raw records versus 280089 acquired; envelope size corresponds to 14000
+records and IMU to 5120 (~146.3 Hz). These sizes are not content verification.
+Maximum measured SD write 268533 us, sync group 642324 us.
+UDP ADC delivery was 94.9627%. Bulk UART download timed out with missing
+#FDONE despite the enlarged RX buffer. No retry after the user requested
+completion. Storage reliability and bulk UART download reliability remain
+unresolved; the buffer change is a mitigation, not a demonstrated full fix.
+
+The final-image phase/lifecycle run planned after this capture did not run.
+Phase/label behavior passed on the earlier dedicated-task image as recorded
+above; host tests cover the implementation. End-to-end auxiliary receipt
+and clock accuracy remain unverified and require Ana's receiver changes.
+
+Stopped further testing at the user's request. Benchmark cleanup had issued
+stop/radio-off. A final COM9 session sent UART-on, radio-off, demo, label0/0,
+max and status commands, but returned no serial response within 3 seconds;
+therefore final device state was not independently confirmed. COM9 is closed
+and released. No monitor or auxiliary source was modified; no SD files were
+deleted or card formatted. No git push performed by this task.

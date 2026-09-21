@@ -25,6 +25,10 @@ class Card:
         self.s.rts = False
         self.s.port = port
         self.s.open()
+        if hasattr(self.s, 'set_buffer_size'):
+            # Windows' small default RX buffer can overrun during multi-MB
+            # 460800-baud downloads; this does not guarantee lossless transfer.
+            self.s.set_buffer_size(rx_size=1024 * 1024, tx_size=65536)
         self.send('U1?')
         status = self.until('#STATUS:')
         fields = list(map(int, status.split(':')[1].split(',')))
