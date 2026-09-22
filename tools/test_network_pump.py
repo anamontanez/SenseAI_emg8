@@ -33,29 +33,28 @@ struct Harness {
     }
 """
         checks = r"""
-    constexpr bool run() {
+    constexpr int run() {
         Batch b;
-        pumpQueue(1,b,0,8,3,0);
-        if (sends!=1 || delivered!=3 || available!=7 || b.count) return false;
+        pumpQueue(1,b,0,8,3,2,30,0);
+        if (sends!=2 || delivered!=6 || available!=4 || b.count) return __LINE__;
         fail=true;
-        pumpQueue(1,b,0,8,3,5);
-        if (sends!=2 || available!=4 || b.count!=3) return false;
-        pumpQueue(1,b,0,8,3,10);
-        if (sends!=3 || available!=4 || b.count!=3) return false;
+        pumpQueue(1,b,0,8,3,2,30,5);
+        if (sends!=3 || available!=1 || b.count!=3) return __LINE__;
+        pumpQueue(1,b,0,8,3,2,30,10);
+        if (sends!=4 || available!=1 || b.count!=3) return __LINE__;
         fail=false;
-        pumpQueue(1,b,0,8,3,15);
-        if (sends!=4 || delivered!=6 || available!=4 || b.count) return false;
-        pumpQueue(1,b,0,8,3,20);
-        if (sends!=5 || delivered!=9 || available!=1 || b.count) return false;
-        pumpQueue(1,b,0,8,3,100);
-        if (sends!=5 || available || b.count!=1) return false;
-        pumpQueue(1,b,0,8,3,129);
-        if (sends!=5 || b.count!=1) return false;
-        pumpQueue(1,b,0,8,3,130);
-        return sends==6 && delivered==10 && b.count==0;
+        pumpQueue(1,b,0,8,3,2,30,15);
+        if (sends!=5 || delivered!=9 || available!=0 || b.count!=1) return __LINE__;
+        pumpQueue(1,b,0,8,3,2,30,20);
+        if (sends!=5 || available || b.count!=1) return __LINE__;
+        pumpQueue(1,b,0,8,3,1,30,44);
+        if (sends!=5 || b.count!=1) return __LINE__;
+        pumpQueue(1,b,0,8,3,1,30,45);
+        return sends==6 && delivered==10 && b.count==0 ? 0 : __LINE__;
     }
 };
-static_assert([] { Harness h; return h.run(); }(), "Packet pump regression");
+constexpr int result=[] { Harness h; return h.run(); }();
+static_assert(result==0, "Packet pump regression; result identifies CHECK line");
 """
         compiler = shutil.which('clang++')
         self.assertIsNotNone(compiler)

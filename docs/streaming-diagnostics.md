@@ -68,15 +68,22 @@ or one idle heap reading. Larger UDP queues do not increase sampling rate
 or fix over-the-air loss, and can increase queued display latency.
 
 
-The sender now attempts at most one packet per stream in each pass, followed
+The sender now attempts up to two raw packets per pass while catching up;
+envelope and IMU remain limited to one packet per pass. Each pass is followed
 by a 5 ms delay normally, or 10 ms when SD has 3000-8999 raw records pending.
 At 9000 pending records, transmission is deferred and pressure is rechecked
-every 5 ms. The moderate-pressure raw service budget is 174 records/10 ms,
-with headroom above the 80 raw records arriving in that time. Raw capacity is nominally 174 records per 5 ms,
-well above the 40 records arriving per 5 ms at 1000 Hz across eight channels.
-A pending full batch is retried before dequeuing more records; success also
-ends that stream's pass. Partial batches retain their normal 30 ms flush.
-This bounds burst work; scheduling, retries and SD deferral can extend delay.
+every 5 ms. The moderate-pressure raw service budget is 348 records/10 ms,
+with headroom above the 80 raw records arriving in that time. A pending full
+batch is retried before dequeuing more records. After a successful retry, one
+additional raw packet may be assembled and sent to reduce the backlog. Partial
+Raw partial batches flush after 30 ms; envelope and IMU partial batches flush
+after 100 ms. This bounds catch-up work while
+avoiding the unrecoverable queue growth measured with a one-packet budget.
+
+Wi-Fi transmit power is capped at the ESP-IDF 8 dBm step. With the present
+auxiliary-board 3.3 V supply, the default 20 dBm ceiling repeatedly caused
+hardware brownout resets even in the SD-free image. The 8 dBm image completed
+the matching 30-second run with zero packet gaps and zero queue drops.
 
 
 ## Measured result on the attached board

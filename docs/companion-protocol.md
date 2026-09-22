@@ -34,7 +34,8 @@ Host acknowledgement means accepted locally, not confirmed by the auxiliary boar
 Bracelet TX GPIO4 to auxiliary RX GPIO3, auxiliary TX GPIO6 to bracelet RX
 GPIO5, common ground,
 115200 baud, 8N1. One dedicated task on core 0 owns every write, with priority
-6, above the UDP sender (5). ADC workers and SD writer remain on core 1.
+4, below the UDP sender (5). UART1 has a 1024-byte RX ring and 512-byte driver
+TX ring. ADC workers and SD writer remain on core 1.
 No companion UART I/O runs inside an ADC callback or the SD writer.
 
 Existing wire framing is retained: `01` = end test, `03` = recording start,
@@ -172,9 +173,10 @@ sensor acquisition timestamp and cannot establish clock alignment.
 This change relays live values only; it does not add auxiliary records
 to bracelet SD files. Ana's controller retains its own SD logging.
 
-Core-0 companion task (priority 6) retains sole ownership of UART1 TX/sync
+Core-0 companion task (priority 4) retains sole ownership of UART1 TX/sync
 and now drains RX nonblocking every <=10 ms under normal scheduling, with
-a 512-byte work budget per pass and a 1024-byte driver RX buffer. Commands
+a 512-byte driver TX ring, a 512-byte work budget per pass, and a 1024-byte
+driver RX buffer. Commands
 still wake it immediately; RX processing follows due commands/syncs.
 A 4096-byte single-producer/single-consumer buffer publishes only complete
 recognized lines (maximum 3078 characters excluding LF). The existing

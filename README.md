@@ -103,7 +103,7 @@ Core 0                          Core 1
 ```
 
 - **ADC service tasks** (x2, core 1, one per I2C bus): each ALERT/RDY ISR timestamps a completion and posts its ADC index. The worker validates the ready event, reads the result, triggers the next single-shot conversion, then publishes the completed sample. It also owns start/stop and checks each ADC's recovery deadline even while its partner is active. Normal builds use separate `i2c_master` transfers; optional throughput builds combine read then trigger in a single legacy-driver command list.
-- **UDP sender** (core 0, priority 5): drains bounded raw/envelope/IMU queues and batches version-1 datagrams, with at most one packet per stream per pass to limit catch-up bursts. Failed sends retain their batch for a later retry. Radio shutdown waits for the sender to finish its current iteration before closing its resources.
+- **UDP sender** (core 0, priority 5): drains bounded raw/envelope/IMU queues and batches version-1 datagrams. Raw data may send two packets per pass only while catching up; envelope and IMU remain limited to one. Failed sends retain their batch for a later retry. Radio shutdown waits for the sender to finish its current iteration before closing its resources.
 - **SD writer** (core 1, priority 5): Drains the sample queues in batches (raw 500 × 8 B ≈ 4 KB). One file set (`R<nnn>.bin`, …) per recording start within the session directory.
 - **UART CSV** (core 0, priority 3): Prints latest readings at ~50 Hz with auto-adjusted column headers per mode, reduced to ~1 Hz while the radio is active.
 - **Main loop** (core 0): Monitors UART commands and reed switch for mode changes, start/stop, and pause/resume.
@@ -331,6 +331,10 @@ Successful sync/close is not a guarantee against card-internal failure or power 
 
 Off by default (radio adds 120–250 mA draw). Send `W1` over UART to enable, `W0` to disable.
 
+Transmit power is capped at the ESP-IDF 8 dBm step. The default 20 dBm setting
+repeatedly triggered brownout resets on the tested auxiliary-board 3.3 V rail;
+8 dBm completed both SD-free and combined SD+UDP tests at short range.
+
 - The bracelet hosts a WPA2 SoftAP: SSID `EMG8-<MAC>`, password `emg8sense`, bracelet IP `192.168.4.1`.
 - Subscribe by sending **any** UDP datagram to `192.168.4.1:3333`; the firmware streams to the sender's address/port from then on. Re-send periodically if your viewer's port may change.
 - The stream carries **everything at full rate** (raw + envelope + IMU; ~71 KB/s of record payload at 1000 Hz/raw in All mode). SD recording reliability requires separate validation with a working card.
@@ -347,7 +351,7 @@ Off by default (radio adds 120–250 mA draw). Send `W1` over UART to enable, `W
 | 10 | 2 | Reserved |
 | 12 | … | Records (8-byte `Sample` or 20-byte `ImuSample`, same layouts as SD) |
 
-Partial batches normally flush after 30 ms. A rejected local send retains its batch and sequence for a later attempt; prolonged congestion can still overflow the bounded queues. `#NET` ERR counts failed send attempts and DROP counts queue overflow. Use reception counts and sequence gaps to assess delivered data. W0 intentionally discards pending data after the sender stops.
+Raw partial batches flush after 30 ms; envelope and IMU partial batches flush after 100 ms to avoid filling Wi-Fi buffers with tiny datagrams. A rejected local send retains its batch and sequence for a later attempt; prolonged congestion can still overflow the bounded queues. `#NET` ERR counts failed send attempts and DROP counts queue overflow. Use reception counts and sequence gaps to assess delivered data. W0 intentionally discards pending data after the sender stops.
 
 Minimal Python receiver:
 
@@ -504,9 +508,12 @@ changes needed in Ana's repository. Default phase is demo; send Prest/Pgrasp
 before starting a test, send transitions while recording, and Pdemo when
 leaving the session. Phase persists across pauses and mode changes.
 
-All companion UART writes now belong to a dedicated core-0 task (priority 6),
-above UDP (5). ADC workers and SD writing remain on core 1. Sync frames use
-an immutable recording epoch and are independent of CSV output and U0.
+All companion UART writes now belong to a dedicated core-0 task (priority 4),
+below UDP (5). UART1 uses a 1024-byte RX ring and 512-byte driver TX ring;
+the monitor's start/phase/stop frames remain ordered in the companion event
+queue, while low-rate auxiliary measurements can wait in the buffers. ADC
+workers and SD writing remain on core 1. Sync frames use an immutable recording
+epoch and are independent of CSV output and U0.
 Use U1 for command acknowledgements; U0 still mutes all PC UART output.
 One-way synchronization cannot establish precise cross-board alignment without
 receiver fixes and measurements. The receiver/monitor repositories are unchanged.

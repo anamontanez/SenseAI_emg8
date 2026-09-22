@@ -1723,3 +1723,33 @@ Combined35s All/1000Hz SD+UDP validation:
 Final28host tests passed and git diff --check passed. Monitor and Ana source
 unchanged (Ana retains her pre-existing sdkconfig modification). Current
 firmware remains flashed; no push performed.
+
+## 2026-09-21 - UDP failure isolation, recovery, and UART buffering
+
+The first combined SD+UDP runs with the default Wi-Fi transmit ceiling reset
+with `#BOOT:reset=BROWNOUT(9)`, including an SD-free run. This separated the
+failure from the SD queue: the present auxiliary-board 3.3 V rail cannot hold
+the radio's default current peaks. A 13 dBm trial avoided reset but produced
+sustained Wi-Fi buffer failures (`NETDIAG DROP=10007`). The stable tested
+firmware setting is the ESP-IDF 8 dBm step (`esp_wifi_set_max_tx_power(40)`).
+Restoring the CP2102 3.3 V connection may help only if that source is backed by
+a regulator and decoupling capable of the ESP32-S3 plus SD peak current; the
+CP2102 3.3 V output alone should not be treated as a power upgrade.
+
+The raw UDP sender now permits two packets per service pass only while a raw
+backlog is present, allowing recovery after transient `ENOMEM` without
+creating a steady-state burst. Envelope and IMU partial batches flush after
+100 ms instead of 30 ms, avoiding needless small datagrams during SD writes.
+The final 30 s file-level run at 8 dBm (`benchmarks/final-fix-lowrate-sd-udp-30`)
+had `NETDIAG TX=1916 ERR=0 DROP=0`, zero SD queue drops, matching ADC counts,
+and no reset. The received UDP records all matched the SD records; the host
+still observed a few over-air/host gaps (`raw=7, env=1, imu=1`), so SD remains
+the authoritative complete stream and monitor-side gap indicators/smoothing
+are still appropriate.
+
+UART1 was then changed to a 1024-byte RX ring plus a 512-byte driver TX ring.
+The companion task now runs at core-0 priority 4 below UDP priority 5 and
+above the host preview priority 3. Start, phase (grasp/rest/demo), stop, and
+sync frames still pass through the ordered 32-entry control queue; only the
+low-rate auxiliary receive/forward path is allowed to wait in the buffers.
+The 28-test host suite passes after this change.

@@ -15,6 +15,9 @@ extern QueueHandle_t companionRxEvents;
 namespace {
 constexpr uart_port_t kPort = UART_NUM_1;
 constexpr int64_t kPeriodUs = 30000000;
+static constexpr int kRxBufferBytes = 1024;
+static constexpr int kTxBufferBytes = 512;
+static constexpr int kTaskPriority = 4;
 enum class Kind : uint8_t { Start, Stop, Phase };
 struct Event {
     Kind kind;
@@ -27,8 +30,8 @@ std::atomic<uint32_t> starts{0}, stops{0}, phases{0}, syncs{0};
 std::atomic<uint32_t> queueErrors{0}, txErrors{0};
 
 bool writeFrame(const uint8_t* bytes, size_t size) {
-    // No TX ring buffer: the only writer waits for room in the hardware FIFO.
-    // Short frames and no flow control bound normal wire time to <1 ms.
+    // Queue into the driver's TX ring. The event queue preserves ordering for
+    // the monitor's start, phase, and stop control frames.
     if (uart_write_bytes(kPort, bytes, size) == static_cast<int>(size)) return true;
     ++txErrors;
     return false;  // do not retry a possibly partial frame without framing recovery
@@ -56,6 +59,9 @@ void linkTask(void*) {
     while (true) {
         // At 115200 baud a 1024-byte RX ring holds ~89 ms. Drain every 10 ms,
         // even between recordings/syncs; control events still wake immediately.
+        // This task runs below the UDP sender because auxiliary measurements
+        // are low-rate. Monitor control frames remain ordered in the event
+        // queue and are queued promptly into the TX ring.
         const TickType_t rxWait = pdMS_TO_TICKS(10) ? pdMS_TO_TICKS(10) : 1;
         TickType_t wait = rxWait;
         if (active) {
@@ -120,13 +126,14 @@ void companionInit() {
     cfg.stop_bits = UART_STOP_BITS_1;
     cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
     cfg.source_clk = UART_SCLK_DEFAULT;
-    ESP_ERROR_CHECK(uart_driver_install(kPort, 1024, 0, 16, &companionRxEvents, 0));
+    ESP_ERROR_CHECK(uart_driver_install(kPort, kRxBufferBytes, kTxBufferBytes,
+                                        16, &companionRxEvents, 0));
     ESP_ERROR_CHECK(uart_param_config(kPort, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(kPort, GPIO_NUM_4, GPIO_NUM_5,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     events = xQueueCreate(32, sizeof(Event));
     if (!events || xTaskCreatePinnedToCore(linkTask, "companion", 3072, nullptr,
-                                          6, nullptr, 0) != pdPASS)
+                                          kTaskPriority, nullptr, 0) != pdPASS)
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
 }
 

@@ -43,13 +43,14 @@ struct Harness {
     uint32_t lastClientMs=1;
     static constexpr int kQuietWatchdogMs=20000, kTypeRaw=0, kTypeEnv=1, kTypeImu=2;
     static constexpr int kMaxRawRecs=174, kMaxImuRecs=69;
+    static constexpr uint32_t kRawFlushMs=30, kLowRateFlushMs=100;
     constexpr long long esp_timer_get_time() { return 60000000; }
     constexpr void pollSubscribe() { ++polls; }
     constexpr void observeNetwork(NetStoragePressure) {}
     constexpr bool hostUartQuiet() { return quiet; }
     constexpr void hostSetUartQuiet(bool next) { quiet=next; }
     constexpr void printf(const char*) {}
-    constexpr void pumpQueue(int,int&,int,unsigned long long,int,uint32_t) { ++pumps; }
+    constexpr void pumpQueue(int,int&,int,unsigned long long,int,int,uint32_t,uint32_t) { ++pumps; }
     constexpr void vTaskDelay(int ms) { delaySum+=ms; ++iterations; storagePressureProbe.level=NetStoragePressure::None; }
     constexpr void ulTaskNotifyTake(int,int) { ++iterations; }
     constexpr void xSemaphoreGive(int) { ++acknowledgements; }

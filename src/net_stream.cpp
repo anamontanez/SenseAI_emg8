@@ -28,6 +28,14 @@ constexpr uint16_t kUdpPort   = 3333;
 constexpr char     kApPass[]  = "emg8sense";  // WPA2, documented in README
 constexpr uint8_t  kApChannel = 6;
 
+// Quarter-dBm units used by esp_wifi_set_max_tx_power(). ESP-IDF maps 40 to
+// its 8 dBm step. This was the highest stable setting selected by the current
+// power-path tests: the default 20 dBm browned out and 13 dBm caused sustained
+// Wi-Fi buffer failures, while 8 dBm recovered all transient send failures.
+#ifndef EMG8_WIFI_TX_POWER_QDBM
+#define EMG8_WIFI_TX_POWER_QDBM 40
+#endif
+
 constexpr uint8_t kTypeRaw = 0;
 constexpr uint8_t kTypeEnv = 1;
 constexpr uint8_t kTypeImu = 2;
@@ -36,7 +44,8 @@ constexpr int kHdrSize      = 12;
 constexpr int kMaxPayload   = 1392;             // fits 1404-byte datagram < MTU
 constexpr int kMaxRawRecs   = kMaxPayload / sizeof(Sample);     // 174
 constexpr int kMaxImuRecs   = kMaxPayload / sizeof(ImuSample);  // 69
-constexpr uint32_t kFlushMs = 30;               // partial-batch latency bound
+constexpr uint32_t kRawFlushMs = 30;             // raw usually fills first
+constexpr uint32_t kLowRateFlushMs = 100;         // reduce tiny env/IMU datagrams
 
 // Queue sizes: sender drains every few ms, these only ride out WiFi hiccups
 constexpr int kRawQLen = 1500;   // 187.5 ms at 8 kSa/s; +4 KB, preserve Wi-Fi heap
@@ -165,27 +174,39 @@ bool sendBatch(Batch& b, uint8_t type, size_t recSize) {
     return true;
 }
 
-/** Send at most one packet per stream/pass to bound Wi-Fi catch-up bursts. */
+/** Send a bounded number of packets per stream/pass.
+ *
+ * A single-packet budget cannot recover reliably after a short ENOMEM run:
+ * while the retained packet is retried, new raw samples keep filling rawQ.
+ * The raw stream therefore gets a two-packet catch-up budget. In steady state
+ * there is only one full packet available, so this does not increase the
+ * normal transmit burst. The low-rate streams retain a one-packet budget.
+ */
 void pumpQueue(QueueHandle_t q, Batch& b, uint8_t type, size_t recSize,
-               int maxRecs, uint32_t nowMs) {
-    // A full batch may be waiting after a failed send. Retry it before
-    // removing any more records from the bounded queue. A success also ends
-    // this pass: raw capacity remains 174 records/5 ms versus ~40 arriving.
-    if (b.count == maxRecs) {
-        sendBatch(b, type, recSize);
-        return;
-    }
-    while (b.count < maxRecs &&
-           xQueueReceive(q, b.buf + kHdrSize + b.count * recSize, 0) == pdTRUE) {
-        if (b.count == 0) b.firstMs = nowMs;
-        b.count++;
+               int maxRecs, int packetBudget, uint32_t flushMs, uint32_t nowMs) {
+    int packets = 0;
+    while (packets < packetBudget) {
+        // A full batch may be waiting after a failed send. Retry it before
+        // removing any more records from the bounded queue. Stop immediately
+        // if lwIP is still out of buffers; the batch remains intact.
         if (b.count == maxRecs) {
-            sendBatch(b, type, recSize);
-            return;
+            if (!sendBatch(b, type, recSize)) return;
+            ++packets;
+            continue;
         }
-    }
-    if (b.count > 0 && (nowMs - b.firstMs) >= kFlushMs) {
-        sendBatch(b, type, recSize);
+        while (b.count < maxRecs &&
+               xQueueReceive(q, b.buf + kHdrSize + b.count * recSize, 0) == pdTRUE) {
+            if (b.count == 0) b.firstMs = nowMs;
+            b.count++;
+        }
+        if (b.count == maxRecs) {
+            if (!sendBatch(b, type, recSize)) return;
+            ++packets;
+            continue;
+        }
+        if (b.count > 0 && (nowMs - b.firstMs) >= flushMs)
+            sendBatch(b, type, recSize);
+        return;
     }
 }
 
@@ -245,12 +266,15 @@ void netTask(void*) {
         }
 
         uint32_t nowMs = (uint32_t)(esp_timer_get_time() / 1000);
-        pumpQueue(rawQ, batches[kTypeRaw], kTypeRaw, sizeof(Sample), kMaxRawRecs, nowMs);
-        pumpQueue(envQ, batches[kTypeEnv], kTypeEnv, sizeof(Sample), kMaxRawRecs, nowMs);
-        pumpQueue(imuQ, batches[kTypeImu], kTypeImu, sizeof(ImuSample), kMaxImuRecs, nowMs);
+        pumpQueue(rawQ, batches[kTypeRaw], kTypeRaw, sizeof(Sample), kMaxRawRecs,
+                  2, kRawFlushMs, nowMs);
+        pumpQueue(envQ, batches[kTypeEnv], kTypeEnv, sizeof(Sample), kMaxRawRecs,
+                  1, kLowRateFlushMs, nowMs);
+        pumpQueue(imuQ, batches[kTypeImu], kTypeImu, sizeof(ImuSample), kMaxImuRecs,
+                  1, kLowRateFlushMs, nowMs);
 
-        // One raw packet per 10 ms still serves 17.4 krecords/s versus 8k
-        // arriving. Leave margin for send time and scheduling under pressure.
+        // Two raw packets per 10 ms still leave catch-up margin above the 8k
+        // records/s arrival rate while bounding work under storage pressure.
         vTaskDelay(pdMS_TO_TICKS(pressure == NetStoragePressure::Throttle ? 10 : 5));
     }
 }
@@ -313,6 +337,15 @@ esp_err_t netStreamStart(const char* macStr) {
 
     err = esp_wifi_start();
     if (err != ESP_OK) return err;
+
+    // Limit radio current peaks. The default ESP-IDF ceiling repeatedly
+    // triggered the ESP32-S3 brownout detector on the bracelet's present
+    // auxiliary-board supply, including with SD support compiled out.
+    err = esp_wifi_set_max_tx_power(EMG8_WIFI_TX_POWER_QDBM);
+    if (err != ESP_OK) {
+        esp_wifi_stop();
+        return err;
+    }
 
     if (rawQ == nullptr) rawQ = xQueueCreate(kRawQLen, sizeof(Sample));
     if (envQ == nullptr) envQ = xQueueCreate(kEnvQLen, sizeof(Sample));
