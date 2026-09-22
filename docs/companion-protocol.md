@@ -18,6 +18,7 @@ The session commands are newline terminated and case sensitive:
 | `Pgrasp\n` | Active session, grasp begins | `#PHASE:grasp` | `04` |
 | `Prest\n` | Active session, rest begins | `#PHASE:rest` | `05` |
 | `Pdemo\n` | Free recording outside a test session | `#PHASE:demo` | `06` |
+| `Psweep\n` | Request an auxiliary impedance sweep during recording; phase is unchanged | `#SWEEP:queued` | `05` |
 | `P?\n` | Query current phase | `#PHASE:<name>` | none |
 | `L<id>,<repetition>\n` | Set movement label and repetition | `#LABEL:<id>,<repetition>` | none |
 
@@ -28,6 +29,10 @@ Boot defaults to demo. Phase persists across pause, stop and mode changes;
 send `Pdemo` when leaving a session, before any subsequent free recording.
 Repeated phase commands resend the byte (there is no companion acknowledgement).
 Host acknowledgement means accepted locally, not confirmed by the auxiliary board.
+`Psweep` is accepted only while recording and deliberately does not create a
+phase metadata event. The current auxiliary firmware ignores `05` while idle,
+so a reference sweep before the bracelet starts requires a corresponding
+auxiliary-firmware change.
 
 ## Companion UART1
 

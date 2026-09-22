@@ -1391,11 +1391,25 @@ static void processUartLine(const char* line, int len) {
             printf("#PHASE:%s\n", phaseName(currentPhase));
             return;
         }
+        if (strcmp(line, "Psweep") == 0) {
+            // 0x05 is the auxiliary impedance-sweep trigger. Send it without
+            // changing the bracelet phase or SD metadata.
+            if (!recording.load(std::memory_order_relaxed)) {
+                printf("#ERR:SWEEP:REQUIRES_RECORDING\n");
+                return;
+            }
+            if (!companionPhase(SessionPhase::Rest)) {
+                printf("#ERR:LINK_QUEUE\n");
+                return;
+            }
+            printf("#SWEEP:queued\n");
+            return;
+        }
         SessionPhase next;
         if (strcmp(line, "Pgrasp") == 0) next = SessionPhase::Grasp;
         else if (strcmp(line, "Prest") == 0) next = SessionPhase::Rest;
         else if (strcmp(line, "Pdemo") == 0) next = SessionPhase::Demo;
-        else { printf("#ERR:PHASE:USE_Pgrasp_Prest_OR_Pdemo\n"); return; }
+        else { printf("#ERR:PHASE:USE_Pgrasp_Prest_Pdemo_OR_Psweep\n"); return; }
         // Main is the only producer; the SD consumer can only free more space.
         if (recording && sdOK && (!labelQ || uxQueueSpacesAvailable(labelQ) == 0)) {
             printf("#ERR:METADATA_QUEUE\n"); return;

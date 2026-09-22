@@ -195,6 +195,7 @@ The firmware emits a mix of:
 | `W0` | `W0` | Disable WiFi (prints `#NET` stats) |
 | `U0` / `U1` | `U0` | Silence / restore UART output; command reception stays active |
 | `Pgrasp` / `Prest` / `Pdemo` | `Pgrasp\n` | Set session phase and notify the companion |
+| `Psweep` | `Psweep\n` | Request an auxiliary impedance sweep during recording without changing phase |
 | `P?` | `P?\n` | Query session phase |
 | `L<id>,<rep>` | `L7,3` | Set current grasp label and repetition |
 | `F` | `F` | List files on the SD card |
@@ -507,6 +508,9 @@ monitor commands, companion UART bytes, SD metadata extension, and receiver
 changes needed in Ana's repository. Default phase is demo; send Prest/Pgrasp
 before starting a test, send transitions while recording, and Pdemo when
 leaving the session. Phase persists across pauses and mode changes.
+`Psweep` requests the auxiliary impedance sweep while recording without
+changing the bracelet phase; the current auxiliary firmware cannot run that
+trigger while idle.
 
 All companion UART writes now belong to a dedicated core-0 task (priority 4),
 below UDP (5). UART1 uses a 1024-byte RX ring and 512-byte driver TX ring;
@@ -515,6 +519,8 @@ queue, while low-rate auxiliary measurements can wait in the buffers. ADC
 workers and SD writing remain on core 1. Sync frames use an immutable recording
 epoch and are independent of CSV output and U0.
 Use U1 for command acknowledgements; U0 still mutes all PC UART output.
+Auxiliary lines are therefore dropped while U0 is active; keep U1 enabled when
+the monitor needs those variables. They are not currently included in UDP.
 One-way synchronization cannot establish precise cross-board alignment without
 receiver fixes and measurements. The receiver/monitor repositories are unchanged.
 
