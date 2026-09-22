@@ -48,17 +48,29 @@ void companionForward(bool live) {
     // companion task waiting on the laptop. No allocations or large stack copy.
     static int64_t next = 0;
     const int64_t now = esp_timer_get_time();
-    const bool enabled = live && !hostUartQuiet();
-    if (enabled && now < next) return;
-    next = enabled ? now + 1000000 : 0;
+    // Keep the relay on a one-second heartbeat. U0 mutes ordinary firmware
+    // output, but auxiliary lines remain available to a monitor listening on
+    // UART0; the input side is still drained frequently by companionLinkTask
+    // so a complete impedance sweep cannot overflow the driver RX ring.
+    if (live && now < next) return;
+    next = live ? now + 1000000 : 0;
     const uint32_t limit = buffer.snapshot(); // new arrivals wait for next batch
     CompanionRxBuffer::View view{};
     while (buffer.peek(limit, view)) {
-        if (enabled && !hostUartQuiet()) {
+        if (live && !hostUartQuiet()) {
             // One stdio call holds its stream lock for the entire line, even
             // when the ring wraps. No raw UART writes mixed with other prints.
             int count = printf("%.*s%.*s\n", int(view.firstSize), view.first,
                                int(view.secondSize), view.second);
+            if (count == int(view.firstSize + view.secondSize + 1)) ++forwarded;
+            else ++dropped;
+        } else if (live) {
+            // hostPrintf suppresses normal output in U0, so write only the
+            // complete auxiliary line directly at the low relay rate.
+            int count = uart_write_bytes(UART_NUM_0, view.first, view.firstSize);
+            count += uart_write_bytes(UART_NUM_0, view.second, view.secondSize);
+            static const uint8_t lf = '\n';
+            count += uart_write_bytes(UART_NUM_0, &lf, 1);
             if (count == int(view.firstSize + view.secondSize + 1)) ++forwarded;
             else ++dropped;
         } else ++muted;

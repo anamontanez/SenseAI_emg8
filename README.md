@@ -518,9 +518,10 @@ the monitor's start/phase/stop frames remain ordered in the companion event
 queue, while low-rate auxiliary measurements can wait in the buffers. ADC
 workers and SD writing remain on core 1. Sync frames use an immutable recording
 epoch and are independent of CSV output and U0.
-Use U1 for command acknowledgements; U0 still mutes all PC UART output.
-Auxiliary lines are therefore dropped while U0 is active; keep U1 enabled when
-the monitor needs those variables. They are not currently included in UDP.
+Use U1 for command acknowledgements; U0 mutes ordinary PC UART output but
+continues forwarding complete auxiliary lines at most once per second while
+recording. The monitor can keep its low-rate auxiliary relay on UART without a
+new UDP packet type.
 One-way synchronization cannot establish precise cross-board alignment without
 receiver fixes and measurements. The receiver/monitor repositories are unchanged.
 

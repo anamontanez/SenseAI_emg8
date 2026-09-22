@@ -42,10 +42,11 @@ void netStreamStop();
 bool netStreamActive();
 
 /**
- * @brief UDP-only mode: silence everything the device writes to UART0.
+ * @brief Mute ordinary device output on UART0 for UDP operation.
  *
- * Receive stays enabled on purpose. `U1` has to work blind, so muting the
- * transmit side must never cost us the way back in.
+ * Receive stays enabled on purpose. Complete auxiliary lines still use UART0
+ * at a low rate while recording, so no new UDP packet type is needed. `U1`
+ * has to work blind, so muting ordinary output must never cost us the way back in.
  */
 void hostSetUartQuiet(bool quiet);
 bool hostUartQuiet(void);

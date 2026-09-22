@@ -7,9 +7,11 @@ The monitor and auxiliary repositories are not modified by this change.
 
 460800 baud, 8N1. Send commands over UART; receive full acquisition data over
 UDP. CSV `D,` lines are latest-value snapshots (~50 Hz with Wi-Fi off, ~1 Hz
-with Wi-Fi enabled), not the acquisition sample rate. `U0` suppresses all
+with Wi-Fi enabled), not the acquisition sample rate. `U0` suppresses ordinary
 UART output, including acknowledgements, but leaves command reception active.
-Use `U1` when acknowledgements are required; this does not disable UDP.
+Complete auxiliary lines still relay on UART0 at most once per second while
+recording. Use `U1` when acknowledgements are required; this does not disable
+UDP.
 
 The session commands are newline terminated and case sensitive:
 
@@ -196,8 +198,9 @@ Validation checks framing/tags, not numerical plausibility; without a
 checksum undetected corruption remains possible. Finite buffering is not
 a lossless-delivery guarantee.
 
-`U0` and stopped recording suppress forwarding and discard completed
-pending lines. Resume with `U1` while recording for new live measurements.
+Stopped recording discards completed pending lines. During recording, U0 only
+suppresses ordinary output; complete auxiliary lines continue through UART0 at
+the one-second relay heartbeat. Resume with `U1` for acknowledgements.
 Do not expect stop-time or quiet-period measurements to be replayed. SD
 binary downloads hold the stdout stream lock through FDATA/body/FDONE so
 auxiliary/preview printf output cannot enter the binary payload.
