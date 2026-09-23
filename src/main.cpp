@@ -370,12 +370,12 @@ static void updateStatusLed() {
     } else if (uartHostSeen) {
         red = 32; green = 10; // UART command received; radio off
     } else {
-        // Dim, slow idle color cycle. No timer or extra task is needed.
-        static constexpr uint8_t colors[6][3] = {
-            {12, 0, 0}, {12, 5, 0}, {0, 12, 0},
-            {0, 9, 9}, {0, 0, 12}, {9, 0, 9}};
-        const uint8_t* color = colors[(nowMs / 1200) % 6];
-        red = color[0]; green = color[1]; blue = color[2];
+        // Dim idle cycle: walk one brightness step at a time from green to
+        // blue and back. The 8-second triangle has no hue jump at its wrap.
+        const uint32_t phase = nowMs % 8000;
+        const uint32_t ramp = phase <= 4000 ? phase : 8000 - phase;
+        blue = static_cast<uint8_t>((12 * ramp + 2000) / 4000);
+        green = 12 - blue;
     }
     if (led->isOn() != on) {
         if (on) { led->setColor(red, green, blue); led->turnOn(); }
