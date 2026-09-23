@@ -28,7 +28,7 @@ def run(args):
         card.until('#RATE:')
         card.send('1')
         active = True
-        card.until('#REC')
+        card.until('#REC', seconds=35)
         start = time.perf_counter()
         commands = [(3, 'Pgrasp\n'), (5, 'U0L8,4\nPrest\n'),
                     (7, 'U1P?\n'), (8, 'W1'), (12, 'Pdemo\n'),

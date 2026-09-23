@@ -1753,3 +1753,28 @@ above the host preview priority 3. Start, phase (grasp/rest/demo), stop, and
 sync frames still pass through the ordered 32-entry control queue; only the
 low-rate auxiliary receive/forward path is allowed to wait in the buffers.
 The 28-test host suite passes after this change.
+
+## 2026-09-22 - Countdown and visible status
+
+Default start countdown is now 10 seconds. UART line commands `C1`..`C30`
+select the next start delay and `C?` queries it; both return `#CDCFG:<seconds>`.
+The countdown uses elapsed time so incoming UART bytes do not shorten a tick.
+Bench scripts now allow the full 30-second setting before expecting `#REC`.
+
+The main task alone drives the WS2812 LED. Idle before a UART command uses a
+dim slow color cycle; stopped Wi-Fi mode is blue and stopped UART-command mode
+is orange. Recording is dim green, countdown is dim orange blinking, and ADC
+and SD faults have distinct purple/red patterns. The SD task publishes an
+atomic fault code instead of invoking the blocking RMT LED driver. Wi-Fi blue
+means the AP is active, and UART orange means a command was received since
+boot; neither is a physical link-quality measurement.
+
+Read-only review of Ana's auxiliary state machine found that REST byte `0x05`
+leaves GRASP sensor sampling and runs a sweep. `Psweep` is now accepted only
+while already recording in REST; an idle or GRASP sweep needs a distinct
+auxiliary command. This prevents the master phase label from silently
+disagreeing with the auxiliary's state.
+
+Host suite: 28 checks passed. The `esp32-s3-storage-bench` image built
+successfully (72224 bytes static RAM, 934298 bytes flash). COM9 was absent
+at the final port check, so this image was not flashed or hardware-tested.

@@ -155,6 +155,7 @@ static inline bool isRawCh(uint8_t adcId, uint8_t ch) {
 // configuration, do not change it without re-checking #CNT.
 static constexpr uint8_t kSLOW_DIV = 20;
 static bool limitFastRate1000 = true;   // Boot at 1000 Hz; copied to workers at start.
+static int countdownSeconds = 10;        // UART C1..C30 changes the next start.
 static std::atomic<bool> recordingRate1000{false};  // SD header snapshot.
 static constexpr auto    kADC_RATE = ADS1015::ConfigRate::Rate_3300Hz;
 
@@ -240,6 +241,9 @@ static volatile Mode mode      = Mode::Idle;
 static std::atomic<bool> recording{false};
 static std::atomic<int64_t> recStart{0};     // µs epoch for timestamps
 static std::atomic<bool> sdOK{false};           // Shared with the SD writer
+enum class SdFault : uint8_t { None, Init, Open, Write, Sync, Close };
+static std::atomic<SdFault> sdFault{SdFault::None};
+static bool uartHostSeen = false;                // UART0 has received a command since boot.
 
 // Separate queues for each stream → separate files
 static QueueHandle_t rawQ   = nullptr;         // raw EMG (ch 0,1)
@@ -345,15 +349,44 @@ static void printBootDiagnostics() {
 
 static void updateStatusLed() {
     if (!led) return;
-
-    if (!adcOK || !sdOK) {
-        led->setColor(255, 0, 0);
-    } else if (recording) {
-        led->setColor(0, 255, 0);
+    // Called only from the main task. Do not make the SD writer wait for RMT.
+    const uint32_t nowMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    uint8_t red = 0, green = 0, blue = 0;
+    bool on = true;
+    const SdFault fault = sdFault.load(std::memory_order_relaxed);
+    if (!adcOK) {
+        red = 32; blue = 24; // ADC fault: purple
+    } else if (fault == SdFault::Init || (!sdOK && fault == SdFault::None)) {
+        red = 24; // SD unavailable at boot: steady dim red
+    } else if (fault != SdFault::None || !sdOK) {
+        red = 48;
+        // Open fault: slow red flash. Write/sync/close fault: fast red flash.
+        on = fault == SdFault::Open ? (nowMs / 600) % 2 == 0
+                                    : (nowMs / 150) % 2 == 0;
+    } else if (recording.load(std::memory_order_relaxed)) {
+        green = 32;
+    } else if (netStreamActive()) {
+        blue = 32; // Wi-Fi AP active
+    } else if (uartHostSeen) {
+        red = 32; green = 10; // UART command received; radio off
     } else {
-        led->setColor(0, 0, 255);
+        // Dim, slow idle color cycle. No timer or extra task is needed.
+        static constexpr uint8_t colors[6][3] = {
+            {12, 0, 0}, {12, 5, 0}, {0, 12, 0},
+            {0, 9, 9}, {0, 0, 12}, {9, 0, 9}};
+        const uint8_t* color = colors[(nowMs / 1200) % 6];
+        red = color[0]; green = color[1]; blue = color[2];
     }
-    led->turnOn();
+    if (led->isOn() != on) {
+        if (on) { led->setColor(red, green, blue); led->turnOn(); }
+        else led->turnOff();
+        return;
+    }
+    if (!on) return;
+    uint8_t oldRed, oldGreen, oldBlue;
+    led->getColor(oldRed, oldGreen, oldBlue);
+    if (oldRed != red || oldGreen != green || oldBlue != blue)
+        led->setColor(red, green, blue);
 }
 
 static void printBuildConfig() {
@@ -391,6 +424,7 @@ static void printStatusLine() {
     printf("#SDIO:WRITE_MAX_US=%lu,SYNC_MAX_US=%lu\n",
            (unsigned long)sdWriteMaxUs.load(), (unsigned long)sdSyncMaxUs.load());
     printf("#RATE:%s\n", limitFastRate1000 ? "1000" : "max");
+    printf("#CDCFG:%d\n", countdownSeconds);
     netPrintDiagnostics();
     constexpr uint32_t heapCaps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     printf("#MEM:FREE=%lu,MIN=%lu,LARGEST=%lu\n",
@@ -504,9 +538,12 @@ static void waitImuIdle() {
 static void sdReportError(const char* operation, const char* name, FRESULT error,
                           UINT requested = 0, UINT written = 0) {
     sdOK.store(false, std::memory_order_relaxed);
+    SdFault fault = SdFault::Write;
+    if (strcmp(operation, "SYNC") == 0) fault = SdFault::Sync;
+    else if (strcmp(operation, "CLOSE") == 0) fault = SdFault::Close;
+    sdFault.store(fault, std::memory_order_relaxed);
     printf("#ERR:SD_%s:%s,%d,%u,%u\n", operation, name, (int)error,
            (unsigned)requested, (unsigned)written);
-    updateStatusLed();
 }
 
 static bool sdWriteChecked(FIL* file, const char* name, const void* data, UINT size) {
@@ -555,7 +592,7 @@ static bool sdOpenFiles(const std::string& base) {
         if (fr[2] == FR_OK) sdCloseChecked(&filEnv, "E");
         if (fr[3] == FR_OK) sdCloseChecked(&filImu, "I");
         sdOK = false;
-        updateStatusLed();
+        sdFault.store(SdFault::Open, std::memory_order_relaxed);
         return false;
     }
     recIndex++;
@@ -1029,12 +1066,19 @@ static std::string sdListRoot();     // defined below; shared by 'F' and 'G'
 static bool countdown(int seconds) {
     for (int i = seconds; i > 0; i--) {
         printf("#CD:%d\n", i);
-        led->setColor(255, 180, 0);
+        led->setColor(48, 20, 0);
         led->turnOn();
-        // 10 × 100 ms = 1 second; check UART each tick
-        for (int t = 0; t < 10; t++) {
+        // Keep the second based on elapsed time even when UART bytes arrive.
+        const int64_t secondEnds = esp_timer_get_time() + 1000000;
+        while (true) {
+            int64_t remainingUs = secondEnds - esp_timer_get_time();
+            if (remainingUs <= 0) break;
             uint8_t rx;
-            if (uart_read_bytes(UART_NUM_0, &rx, 1, pdMS_TO_TICKS(100)) > 0) {
+            const uint32_t waitMs = remainingUs > 100000 ? 100 :
+                                    static_cast<uint32_t>((remainingUs + 999) / 1000);
+            TickType_t wait = pdMS_TO_TICKS(waitMs);
+            if (wait == 0) wait = 1;
+            if (uart_read_bytes(UART_NUM_0, &rx, 1, wait) > 0) {
                 // Route through the same parser the command loops use, rather
                 // than matching raw bytes. Matching raw bytes meant any '0'
                 // *inside* a multi-byte command aborted the countdown: "S0"
@@ -1051,7 +1095,8 @@ static bool countdown(int seconds) {
                 // arms the selection, the ADCs aren't running yet.
                 if (c == 'S') handleSensorCommand();
             }
-            if (t == 5) led->turnOff();   // blink: 500ms on, 500ms off
+            if (secondEnds - esp_timer_get_time() <= 500000 && led->isOn())
+                led->turnOff();   // first half on, second half off
         }
     }
     printf("#CD:0\n");
@@ -1163,7 +1208,7 @@ static bool startRecording() {
     // Announce which sensor is live so the host doesn't have to infer it
     // from the CSV header (the selection persists across mode changes).
     if (mode == Mode::Sensor) printSensorLine();
-    if (!countdown(3)) {
+    if (!countdown(countdownSeconds)) {
         updateStatusLed();
         printf("#STOP\n");
         return false;
@@ -1236,8 +1281,8 @@ static constexpr int64_t  kBotonDebounceUs = 30000;
 static int64_t botonUltimoEdgeAceptadoUs = 0;
 static int64_t botonPresionadoDesdeUs = 0;
 static bool    botonHoldDisparado     = false;
-// Guard against the following bug: startRecording() calls countdown(3),
-// which BLOCKS this whole loop for ~3 real seconds. If the user is still
+// Guard against the following bug: startRecording() blocks for the countdown.
+// If the user is still
 // physically holding the button down when countdown() returns (very easy
 // to do -- a "press and hold until it starts" is a natural gesture), the
 // very next check would see presionado==true with botonPresionadoDesdeUs
@@ -1375,7 +1420,24 @@ static bool parseLabel(const char* text, uint16_t& grasp, uint16_t& repetition) 
 static void processUartLine(const char* line, int len) {
     if (len < 1) return;
 
-    if (line[0] == 'R') {
+    if (line[0] == 'C') {
+        if (strcmp(line, "C?") == 0) {
+            printf("#CDCFG:%d\n", countdownSeconds);
+            return;
+        }
+        int seconds = 0;
+        bool valid = len > 1;
+        for (int i = 1; i < len && valid; ++i) {
+            if (line[i] < '0' || line[i] > '9') valid = false;
+            else {
+                seconds = seconds * 10 + (line[i] - '0');
+                if (seconds > 30) valid = false;
+            }
+        }
+        if (!valid || seconds < 1) printf("#ERR:COUNTDOWN:USE_C1_TO_C30\n");
+        else if (recording) printf("#ERR:BUSY\n");
+        else { countdownSeconds = seconds; printf("#CDCFG:%d\n", seconds); }
+    } else if (line[0] == 'R') {
         if (strcmp(line, "R?") == 0) {
             printf("#RATE:%s\n", limitFastRate1000 ? "1000" : "max");
         } else if (strcmp(line, "R1000") != 0 && strcmp(line, "Rmax") != 0) {
@@ -1392,10 +1454,14 @@ static void processUartLine(const char* line, int len) {
             return;
         }
         if (strcmp(line, "Psweep") == 0) {
-            // 0x05 is the auxiliary impedance-sweep trigger. Send it without
-            // changing the bracelet phase or SD metadata.
+            // 0x05 is REST, not a phase-neutral sweep byte on the auxiliary.
+            // Only repeat it when both controllers are already in REST.
             if (!recording.load(std::memory_order_relaxed)) {
                 printf("#ERR:SWEEP:REQUIRES_RECORDING\n");
+                return;
+            }
+            if (currentPhase != SessionPhase::Rest) {
+                printf("#ERR:SWEEP:REQUIRES_REST\n");
                 return;
             }
             if (!companionPhase(SessionPhase::Rest)) {
@@ -1485,7 +1551,7 @@ static void processUartLine(const char* line, int len) {
 
 /** Feed one byte to the UART line accumulator. Returns single-char cmds. */
 static int feedUartByte(uint8_t b) {
-    // Multi-byte commands start with 'L', 'G', 'R', 'P' and end with '\n'
+    // Multi-byte commands start with 'L', 'G', 'R', 'P', 'C' and end with '\n'
     if (uartLinePos > 0) {
         // We're accumulating a line
         if (b == '\n' || b == '\r') {
@@ -1500,13 +1566,16 @@ static int feedUartByte(uint8_t b) {
     }
 
     // First byte of a potential command
-    if (b == 'L' || b == 'G' || b == 'R' || b == 'P') {
+    if (b == 'L' || b == 'G' || b == 'R' || b == 'P' || b == 'C') {
+        uartHostSeen = true;
         uartLineBuf[0] = (char)b;
         uartLinePos = 1;
         return 0;
     }
 
     // Single-byte commands
+    if ((b >= '0' && b <= '4') || b == '?' || b == 'S' || b == 'V' ||
+        b == 'U' || b == 'W' || b == 'F') uartHostSeen = true;
     return b;
 }
 
@@ -1758,6 +1827,7 @@ extern "C" void app_main() {
 #else
     printf("#BENCH:SD_DISABLED\n");
 #endif
+    if (!sdOK) sdFault.store(SdFault::Init, std::memory_order_relaxed);
 
     /* ---- IMU (ICM-42605 over SPI3) --------------------------------------- */
     esp_log_level_set("ICM42605", ESP_LOG_DEBUG);
@@ -1837,8 +1907,14 @@ extern "C" void app_main() {
 
     bool reedPrev = reedSw->isPressed();
     uint8_t rxByte;
+    uint32_t lastLedMs = 0;
 
     while (mode == Mode::Idle) {
+        uint32_t nowMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+        if (nowMs - lastLedMs >= 100) {
+            lastLedMs = nowMs;
+            updateStatusLed();
+        }
         // Check UART. Timeout kept short (was 50ms) so this loop -- and the
         // button/reed checks below it -- run often enough to catch a fast
         // tap. At 50ms, a genuinely quick press-and-release could complete
@@ -1909,7 +1985,7 @@ extern "C" void app_main() {
 
     /* ==== Start recording ================================================= */
     printf("#MODE:%d\n", (int)mode);
-    if (!countdown(3)) {
+    if (!countdown(countdownSeconds)) {
         // Countdown aborted → go back to idle
         mode = Mode::Idle;
         printf("#STOP\n");
@@ -1955,6 +2031,11 @@ extern "C" void app_main() {
 
     while (true) {
         uint32_t nowMs = (uint32_t)(esp_timer_get_time() / 1000);
+
+        if (nowMs - lastLedMs >= 100) {
+            lastLedMs = nowMs;
+            updateStatusLed();
+        }
 
         if (nowMs - lastHealthMs >= 1000) {
             lastHealthMs = nowMs;

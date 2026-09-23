@@ -270,7 +270,7 @@ def run(args):
         counters.clear()
         started = True
         send(str(args.mode))
-        deadline = time.perf_counter() + 8
+        deadline = time.perf_counter() + 35  # C1..C30 plus startup margin
         while start_time is None and time.perf_counter() < deadline:
             wait(.05)
         if start_time is None:

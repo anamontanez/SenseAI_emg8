@@ -31,7 +31,7 @@ def run(args):
             log_start = log.tell()
             card.send(str(mode))
             active = True
-            card.until('#REC', seconds=10)
+            card.until('#REC', seconds=35)
             time.sleep(duration)
             sent_stop = time.perf_counter()
             card.send('0')

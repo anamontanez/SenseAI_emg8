@@ -150,9 +150,19 @@ Modes can be switched at runtime via UART without rebooting. The reed switch tog
 
 | Color | Meaning |
 |-------|---------|
-| Blue | Booting / paused / stopped |
+| Dim slow color cycle | Idle, no host command received since boot |
+| Blue | Wi-Fi AP active while stopped |
+| Orange | UART command received since boot; Wi-Fi off and stopped |
 | Green | Recording |
-| Red | Init error (ADC or SD failure) |
+| Orange blink | Start countdown |
+| Purple | ADC fault |
+| Dim steady red | SD unavailable at boot |
+| Slow red flash | SD file-open fault |
+| Fast red flash | SD write, sync, or close fault |
+
+The radio and UART colors show firmware state, not a physical link check. SD
+fault colors take precedence over recording and connection colors. The LED is
+updated by the main task only; SD writing merely records the fault state.
 
 ## UART Interface
 
@@ -188,14 +198,15 @@ The firmware emits a mix of:
 | `0` | `0` | Stop / pause acquisition |
 | `R1000` / `Rmax` | `R1000\n` | Select average 1000 Hz ceiling or maximum speed while stopped |
 | `R?` | `R?\n` | Query selected sampling rate |
+| `C1`–`C30` / `C?` | `C10\n` | Set/query the next start countdown in seconds; default 10 |
 | `?` | `?` | Query current status |
 | `V1` | `V1` | Enable 5V rail |
 | `V0` | `V0` | Disable 5V rail |
 | `W1` | `W1` | Enable WiFi SoftAP + UDP streaming |
 | `W0` | `W0` | Disable WiFi (prints `#NET` stats) |
-| `U0` / `U1` | `U0` | Silence / restore UART output; command reception stays active |
+| `U0` / `U1` | `U0` | Mute / restore ordinary UART output; auxiliary lines and command reception stay active |
 | `Pgrasp` / `Prest` / `Pdemo` | `Pgrasp\n` | Set session phase and notify the companion |
-| `Psweep` | `Psweep\n` | Request an auxiliary impedance sweep during recording without changing phase |
+| `Psweep` | `Psweep\n` | Repeat the auxiliary impedance sweep while recording in REST |
 | `P?` | `P?\n` | Query session phase |
 | `L<id>,<rep>` | `L7,3` | Set current grasp label and repetition |
 | `F` | `F` | List files on the SD card |
@@ -203,8 +214,9 @@ The firmware emits a mix of:
 
 Command notes:
 
-- `R1000`, `Rmax`, `R?`, `L<id>,<rep>` and `G<path>` are line commands. Send a terminating newline, for example `L7,3\n`.
+- `R1000`, `Rmax`, `R?`, `C1`–`C30`, `C?`, `L<id>,<rep>` and `G<path>` are line commands. Send a terminating newline, for example `C10\n`.
 - `1`, `2`, and `3` trigger the firmware countdown before acquisition starts.
+- `C1`–`C30` applies to the next start and returns `#CDCFG:<seconds>`; changing it while recording returns `#ERR:BUSY`. The setting resets to 10 seconds on reboot. Countdown ticks use elapsed time and remain cancellable with `0`.
 - `G<path>` is rejected while recording is active and returns `#ERR:BUSY`.
 - `F` and `G` require a mounted SD card. Otherwise the device returns `#ERR:NO_SD`.
 
@@ -241,6 +253,7 @@ UDP and sample record layouts are unchanged.
 | `#INIT:ADC=...,SD=...,IMU=...` | Peripheral init summary |
 | `#MODE:<n>` | Current acquisition mode |
 | `#CD:<n>` | Countdown tick before recording starts |
+| `#CDCFG:<n>` | Configured countdown duration in seconds |
 | `#CD:ABORT` | Countdown cancelled by sending `0` |
 | `#REC` | Recording started or resumed |
 | `#PAUSE` | Recording paused |

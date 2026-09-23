@@ -28,15 +28,23 @@ struct TestFlag {
 };
 using UINT = unsigned;
 enum FRESULT { FR_OK, FR_DISK_ERR };
+enum class SdFault { None, Init, Open, Write, Sync, Close };
 struct FIL {};
+constexpr int strcmp(const char* a, const char* b) {
+    for (; *a && *b && *a == *b; ++a, ++b) {}
+    return *a - *b;
+}
 #define assert(condition) do { if (!(condition)) return __LINE__; } while (0)
 struct TestContext {
     TestFlag sdOK;
-    int ledUpdates = 0, writes = 0, syncs = 0, closes = 0;
+    struct FaultFlag {
+        SdFault value = SdFault::None;
+        constexpr void store(SdFault next, int) { value = next; }
+    } sdFault;
+    int writes = 0, syncs = 0, closes = 0;
     FRESULT result = FR_OK;
     UINT returnedBytes = 8;
     constexpr int printf(const char*, ...) { return 0; }
-    constexpr void updateStatusLed() { ++ledUpdates; }
     constexpr FRESULT f_write(FIL*, const void*, UINT, UINT* written) {
         ++writes; *written = returnedBytes; return result;
     }
@@ -47,11 +55,11 @@ struct TestContext {
 constexpr int run() {
     FIL file{}; char data[8] = {};
     assert(sdWriteChecked(&file, "R", data, sizeof(data)));
-    assert(sdOK && writes == 1 && ledUpdates == 0);
+    assert(sdOK && writes == 1 && sdFault.value == SdFault::None);
     // Full card: FatFs reports success but accepts fewer bytes.
     returnedBytes = 7;
     assert(!sdWriteChecked(&file, "R", data, sizeof(data)));
-    assert(!sdOK && writes == 2 && ledUpdates == 1);
+    assert(!sdOK && writes == 2 && sdFault.value == SdFault::Write);
     sdOK = true; returnedBytes = 0;
     assert(!sdWriteChecked(&file, "R", data, sizeof(data)));
     assert(!sdOK && writes == 3);  // no retry of an ambiguous write
@@ -60,10 +68,10 @@ constexpr int run() {
     assert(!sdOK && writes == 4);  // bytes alone do not establish success
     sdOK = true;
     assert(!sdSyncChecked(&file, "R"));
-    assert(!sdOK && syncs == 1);
+    assert(!sdOK && syncs == 1 && sdFault.value == SdFault::Sync);
     sdOK = true;
     sdCloseChecked(&file, "R");
-    assert(!sdOK && closes == 1);
+    assert(!sdOK && closes == 1 && sdFault.value == SdFault::Close);
     // Even after failure the other handles must still be closable.
     result = FR_OK;
     sdCloseChecked(&file, "E");
