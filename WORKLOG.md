@@ -1968,3 +1968,44 @@ IMU present, and zero drop counters. The query was followed by the full
 three-second UART-color expiry. Physical LED brightness/color still needs the
 operator's visual confirmation. Only bracelet firmware/docs changed; neither
 the monitor nor Ana's auxiliary firmware was edited.
+## 2026-09-28 — Participant-readiness review and SD identity
+
+Reviewed Saturday's tables and both 60-second SD+UDP readbacks against current
+bracelet baseline a782687. The missing UDP packets occurred with ERR=0,
+DROP=0, PAUSES=0 and THROTTLES=0; sampled network raw-queue peaks were 76/65
+of 1500. The tested gaps are not explained by SD-pressure suppression. Raw
+packets were almost all 174 records/1404 UDP bytes. Saved raw rates were
+998.42–999.93 Hz and p99 intervals 1.940–1.952 ms. Keep packet sizing, ADC
+schedule, cap, buffers and priorities for the next collection; envelope
+interleaving and limiter placement need a separate measured comparison.
+
+SD files had no participant or host-session identifier. Added UART
+J<subject>,<session> with strict 32/64-character ASCII code limits, J? query,
+and J- explicit return to free recording. Tagged starts sync a new Jnnn.json
+before sampling, then acknowledge the exact association with #SESSION. The
+sidecar records firmware ELF SHA256, settings and binary file set; it is marked
+prepared and does not assert completion. M/R/E/I layouts and #SDSUM binary
+byte accounting remain unchanged. No extra handle stays open during sampling.
+
+Tagging opts into one explicit identity per new recording: successful start
+consumes it, failed/cancelled starts preserve it, and a subsequent unarmed
+start is refused. Invalid idle identity commands disarm old tags. Reset clears
+the opt-in; the monitor must arm every participant session. Identity changes
+during countdown/recording are refused. The monitor and auxiliary were not
+modified. Full host contract and review: docs/participant-readiness-2026-09-28.md.
+
+Also reject overlong/binary UART lines instead of silently accepting truncated
+prefixes, and abort before #REC when either initial metadata enqueue fails.
+Added #FIRMWARE:ELF_SHA256 to status/config for exact deployed-image tracking.
+Updated the SD bench to optionally arm/download/verify the identity alongside
+binary readback, and corrected stale README LED descriptions.
+
+Validation: original 42 tests passed; updated suite and focused new tests total
+47 passing checks. Storage build succeeded: RAM 72,576 bytes (+264), flash
+942,830 bytes. BIN SHA256 8F42D1F24BE253DDBFCBF82B5AD8F9BDCC8F3876BC299906336BFF8415E8780D;
+ELF SHA256 8748A4630C008042D69F079054F2418A5ABC1DD963878C638613F69020B3085E.
+No flash or hardware acceptance yet; no COM port opened. Baseline packet/SD
+metrics are in benchmarks/robustness-2026-09-28/review-metrics-2026-09-28.json.
+Remaining before participant use: monitor handshake/results integration, two
+tagged SD readbacks and a complete protocol test on the actual station. At the
+Saturday duration, 300 sessions imply ~14.5 GB plus retries and 57 device-hours.

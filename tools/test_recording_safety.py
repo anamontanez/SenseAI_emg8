@@ -20,6 +20,7 @@ class RecordingSafety(unittest.TestCase):
         safety = safety.replace("    static SdFault announced = SdFault::None;", "")
         body = (start + safety).replace("static bool ", "constexpr bool ").replace("static void ", "constexpr void ")
         harness = r'''
+#include "recording_identity.hpp"
 using uint8_t=unsigned char; using uint16_t=unsigned short;
 using uint32_t=unsigned; using uint64_t=unsigned long long;
 namespace std { constexpr int memory_order_relaxed=0; }
@@ -48,7 +49,10 @@ struct Board {
  unsigned curGrasp=1, curRep=2, reportedWrap=0;
  int countdownSeconds=10;
  Text sdFileSet;
+ RecordingIdentitySelection nextIdentity;
+ RecordingIdentity recordingIdentity;
  bool openOK=true, countdownOK=true, linkOK=true, adcStartOK=true, boundaryOK=true;
+ int failMetadata=0;
  int opens=0, closes=0, countdowns=0, starts=0, recAcks=0, stopAcks=0;
  int companionStops=0;
  int stops=0, summaries=0, metadata=0, wrapEvents=0;
@@ -76,7 +80,7 @@ struct Board {
  constexpr void stopCompanion(bool) { ++companionStops; }
  constexpr bool startADCs() { ++starts; return adcStartOK; }
  constexpr bool saveMetadata(unsigned kind,SessionPhase,unsigned,unsigned,uint32_t) {
-  ++metadata; if(kind==4) ++wrapEvents; return true;
+  ++metadata; if(kind==4) ++wrapEvents; return metadata!=failMetadata;
  }
  constexpr uint64_t netTakeStreamStart() { auto s=streamStart; streamStart=0; return s; }
  constexpr void stopTest() { recording=false; ++stops; }
@@ -116,6 +120,27 @@ constexpr int run() {
  b.serviceRecordingSafety(); CHECK(b.wrapEvents==1);
  b.elapsed=(2ULL<<32)+456;
  b.serviceRecordingSafety(); CHECK(b.reportedWrap==2 && b.wrapEvents==2);
+ // A participant tag is required for each start once the host opts in.
+ b=Board{}; CHECK(b.nextIdentity.set("S001,visit1",11));
+ b.openOK=false;
+ CHECK(!b.startRecording() && b.nextIdentity.armed && b.recAcks==0);
+ b.openOK=true; b.countdownOK=false;
+ CHECK(!b.startRecording() && b.nextIdentity.armed && b.recAcks==0);
+ b.countdownOK=true;
+ CHECK(b.startRecording() && !b.nextIdentity.armed && b.nextIdentity.required);
+ CHECK(b.recordingIdentity.subject[3]=='1' && b.recordingIdentity.session[5]=='1');
+ b.recording=false;
+ const int opensBefore=b.opens;
+ CHECK(!b.startRecording() && b.opens==opensBefore && b.recAcks==1);
+ b.nextIdentity.clear();
+ CHECK(b.startRecording() && b.recordingIdentity.subject[0]==0);
+ // Neither missing start event may acknowledge recording.
+ for(int failed=1;failed<=2;++failed) {
+  b=Board{}; b.failMetadata=failed; b.nextIdentity.set("S001,visit1",11);
+  CHECK(!b.startRecording() && !b.recording && b.recAcks==0 && b.starts==0);
+  CHECK(b.companionStops==1 && b.closes==1 && b.nextIdentity.armed);
+  CHECK(b.sdFault.load()==SdFault::Metadata && !b.sdRecordingStarted);
+ }
  return 0;
 }
 constexpr int result=run();
@@ -126,4 +151,5 @@ static_assert(result==0,"Recording safety regression: result identifies CHECK li
         with tempfile.TemporaryDirectory() as folder:
             cpp = Path(folder) / "safety.cpp"
             cpp.write_text(harness + body + checks, encoding="utf-8")
-            subprocess.run([compiler, "-std=c++17", "-fsyntax-only", str(cpp)], check=True)
+            subprocess.run([compiler, "-std=c++17", "-fsyntax-only", "-I",
+                            str(Path(__file__).resolve().parents[1] / "src"), str(cpp)], check=True)

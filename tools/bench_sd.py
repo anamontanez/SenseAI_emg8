@@ -71,7 +71,7 @@ class Card:
                 result[name] = int(size)
 
     def download(self, name, size, destination):
-        if not re.fullmatch(r's_[A-Za-z0-9_]+/[REIM][0-9]+\.bin', name):
+        if not re.fullmatch(r's_[A-Za-z0-9_]+/(?:[REIM][0-9]+\.bin|J[0-9]+\.json)', name):
             raise ValueError('Unexpected recording filename: ' + name)
         self.send('G' + name + '\n')
         header = self.until('#FDATA:')
@@ -103,9 +103,27 @@ def verify(folder, files, capture):
     last = {}
     first = {}
     masters = []
+    identities = []
     for name in files:
         data = (folder / Path(name).name).read_bytes()
         kind = name.rsplit('/', 1)[1][0]
+        if kind == 'J':
+            identity = json.loads(data)
+            assert identity['schema'] == 'emg8.identity.v1' and identity['state'] == 'prepared'
+            assert identity['file_set'] == saved['file_set'], 'Wrong identity file set'
+            assert identity['mode'] == summary['mode'], 'Wrong identity mode'
+            assert re.fullmatch(r'[A-Za-z0-9_.-]{1,32}', identity['subject'])
+            assert re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', identity['session'])
+            assert re.fullmatch(r'[a-f0-9]{64}', identity['firmware_elf_sha256'])
+            if summary.get('rate'):
+                assert identity['rate'] == summary['rate'], 'Wrong identity rate'
+            if summary.get('identity'):
+                assert identity['subject'] + ',' + identity['session'] == summary['identity'], 'Wrong identity tag'
+                assert summary.get('session_ack') == summary['identity'] + ',' + saved['file_set'], 'Wrong identity acknowledgement'
+            if summary.get('firmware_elf_sha256'):
+                assert identity['firmware_elf_sha256'] == summary['firmware_elf_sha256'], 'Wrong firmware identity'
+            identities.append({'file': name, **identity})
+            continue
         size = 8 if kind in 'RE' else 20 if kind == 'I' else 12
         if kind == 'M':
             assert len(data) >= 32 and data[:8] == b'EMG8\x04\x04\x04\x14'
@@ -154,7 +172,7 @@ def verify(folder, files, capture):
     actual_counts = [sum(disk[k].values()) for k in range(3)]
     reported_counts = [saved['raw'], saved['env'], saved['imu']]
     assert actual_counts == reported_counts, ('Firmware #SDSUM record counts', reported_counts, actual_counts)
-    actual_bytes = sum((folder / Path(name).name).stat().st_size for name in files)
+    actual_bytes = sum((folder / Path(name).name).stat().st_size for name in files if name.endswith('.bin'))
     assert actual_bytes == saved['bytes'], ('Firmware #SDSUM byte count', saved['bytes'], actual_bytes)
     file_dir, file_number = saved['file_set'].rsplit('/', 1)
     expected_master = file_dir + '/M' + file_number
@@ -162,6 +180,12 @@ def verify(folder, files, capture):
     # the F directory listing omits the volume prefix ("session/M000.bin").
     expected_master = expected_master.split(':', 1)[-1].lstrip('/')
     assert expected_master in files, ('Firmware #SDSUM file set', expected_master, files)
+    assert len(identities) <= 1, 'Unexpected identity files'
+    if identities:
+        expected_identity = expected_master.rsplit('/', 1)[0] + '/J' + Path(expected_master).stem[1:] + '.json'
+        assert identities[0]['file'] == expected_identity, 'Wrong identity filename'
+    if summary.get('identity'):
+        assert len(identities) == 1, 'Missing SD identity file'
     if summary.get('rate') == '1000':
         for (adc, ch), count in counts.items():
             hz = 50 if summary['mode'] == 1 and ch in ENV[adc] else 1000
@@ -195,7 +219,7 @@ def verify(folder, files, capture):
     return {'sd_records': [sum(x.values()) for x in disk], 'udp_absent_from_sd': unexpected,
             'sd_absent_from_udp': missing, 'masters': masters,
             'adc_counts_match': True, 'storage_drops': summary['final_status'][6:9],
-            'sd_summary': saved, 'sd_bytes_match': True}
+            'sd_summary': saved, 'sd_bytes_match': True, 'identities': identities}
 
 
 def run(args):
@@ -218,6 +242,8 @@ def run(args):
                 cmd += ['--status-interval', str(args.status_interval)]
             if args.rate:
                 cmd += ['--rate', args.rate]
+            if args.identity:
+                cmd += ['--identity', args.identity]
             if args.wifi_profile:
                 cmd += ['--wifi-profile', args.wifi_profile]
             subprocess.run(cmd, check=True)
@@ -226,7 +252,7 @@ def run(args):
             (out / 'listing-after.json').write_text(json.dumps(after, indent=2))
             assert all(after.get(k) == v for k, v in before.items()), 'Existing file changed'
             created = {k: v for k, v in after.items() if k not in before and not k.endswith('/')}
-            assert len(created) == 4, created
+            assert len(created) in (4, 5), created
             saved = out / 'sd'
             saved.mkdir()
             for name, size in sorted(created.items()):
@@ -250,6 +276,7 @@ if __name__ == '__main__':
     ap.add_argument('--condition', choices=('off', 'udp', 'quiet'), default='udp')
     ap.add_argument('--mode', choices=(1, 2, 3, 4), type=int, default=1)
     ap.add_argument('--rate', choices=('max', '1000'))
+    ap.add_argument('--identity', help='Tag and verify subject,session in a synced SD JSON file')
     ap.add_argument('--status-interval', type=float, default=0)
     ap.add_argument('--seconds', type=float, default=60)
     ap.add_argument('--wifi-profile')

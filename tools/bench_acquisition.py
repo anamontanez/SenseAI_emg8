@@ -12,6 +12,7 @@ import collections
 import datetime
 import json
 from pathlib import Path
+import re
 import socket
 import struct
 import subprocess
@@ -174,6 +175,10 @@ def validate_sd_summary(summary, require_sd):
 
 def run(args):
     import serial
+    identity = getattr(args, 'identity', None)
+    if identity and (not args.require_sd or not re.fullmatch(
+            r'[A-Za-z0-9_.-]{1,32},[A-Za-z0-9_.-]{1,64}', identity)):
+        raise ValueError('--identity requires mounted SD and subject,session codes')
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     metadata = dict(vars(args), utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -284,6 +289,12 @@ def run(args):
             wait(.2)
             if '#RATE:' + args.rate not in logs[rate_log_start:]:
                 raise RuntimeError('Rate selection not acknowledged')
+        if identity:
+            identity_log_start = len(logs)
+            send('J' + identity + '\n')
+            wait(.2)
+            if '#IDENTITY:ARMED,' + identity not in logs[identity_log_start:]:
+                raise RuntimeError('Participant/session identity not acknowledged')
         # Reset networking for an actual no-subscriber condition and empty batches.
         send('W0')
         wait(1)
@@ -319,6 +330,8 @@ def run(args):
             wait(.05)
         if start_time is None:
             raise RuntimeError('No #REC acknowledgement')
+        if identity and not any(line.startswith('#SESSION:' + identity + ',') for line in logs):
+            raise RuntimeError('Missing SD participant/session association at start')
         if args.condition == 'quiet':
             send('U0')
         print(f'RUNNING {args.condition} mode={args.mode} {args.seconds}s -> {output}', flush=True)
@@ -374,6 +387,10 @@ def run(args):
     result.update(condition=args.condition, mode=args.mode, rate=args.rate, host_window_s=elapsed,
                   failure=failure, final_status=status, counts=counters,
                   sd_summary=(sd_summaries[-1] if sd_summaries else None))
+    result['identity'] = identity
+    result['session_ack'] = next((line[9:] for line in reversed(logs) if line.startswith('#SESSION:')), None)
+    result['firmware_elf_sha256'] = next((line.split('=', 1)[1] for line in reversed(logs)
+                                        if line.startswith('#FIRMWARE:ELF_SHA256=')), None)
     result['host_timed_acquired_hz'] = {
         f'{adc}:{ch}': round(values[ch] / elapsed, 3)
         for adc, values in sorted(counters.items()) for ch in range(4)
@@ -397,6 +414,7 @@ if __name__ == '__main__':
     ap.add_argument('--condition', choices=('off', 'nosub', 'udp', 'quiet'), default='udp')
     ap.add_argument('--mode', type=int, choices=(1, 2, 3, 4), default=1)
     ap.add_argument('--rate', choices=('max', '1000'), help='Select rate while stopped; omitted preserves legacy firmware compatibility')
+    ap.add_argument('--identity', help='Tag this SD recording with subject,session (requires updated firmware)')
     ap.add_argument('--require-sd', action='store_true', help='Explicitly test mounted SD; default still requires SD unavailable')
     ap.add_argument('--status-interval', type=float, default=0, help='Query live firmware counters every N seconds; 0 disables')
     ap.add_argument('--seconds', type=float, default=60)

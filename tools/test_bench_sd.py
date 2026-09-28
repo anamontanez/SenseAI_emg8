@@ -52,6 +52,26 @@ class SavedRecords(unittest.TestCase):
         self.assertEqual(result['sd_records'], [16, 16, 2])
         self.assertEqual(result['sd_absent_from_udp'], [0, 0, 0])
 
+    def test_tagged_recording_verifies_identity_and_preserves_binary_byte_total(self):
+        self.summary.update(identity='S023,visit1', session_ack='S023,visit1,s_TEST_0/000.bin',
+                            firmware_elf_sha256='a' * 64)
+        self.write_summary()
+        with self.assertRaisesRegex(AssertionError, 'Missing SD identity'):
+            self.check()
+        self.files.append('s_TEST_0/J000.json')
+        meta = dict(schema='emg8.identity.v1', state='prepared', subject='S023', session='visit1',
+                    file_set='s_TEST_0/000.bin', firmware_elf_sha256='a' * 64, mode=1, rate='1000')
+        path = self.sd / 'J000.json'
+        path.write_text(json.dumps(meta))
+        self.assertTrue(self.check()['sd_bytes_match'])
+        self.assertEqual(self.check()['identities'][0]['subject'], 'S023')
+        for key, wrong, expected in (('subject', 'S024', 'Wrong identity tag'),
+                                     ('file_set', 's_TEST_0/001.bin', 'Wrong identity file set'),
+                                     ('firmware_elf_sha256', 'b' * 64, 'Wrong firmware identity')):
+            path.write_text(json.dumps({**meta, key: wrong}))
+            with self.assertRaisesRegex(AssertionError, expected):
+                self.check()
+
     def test_fatfs_volume_prefix_matches_unprefixed_listing(self):
         self.summary['sd_summary']['file_set'] = '0:/s_TEST_0/000.bin'
         self.write_summary()

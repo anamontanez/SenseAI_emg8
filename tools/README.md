@@ -1,5 +1,11 @@
 # Acquisition bench
 
+Participant tagging: `bench_sd.py --identity BENCH_A,review_01` sends and verifies
+the new UART identity handshake, downloads `Jnnn.json`, and checks its tag,
+firmware hash and file-set association. The JSON is excluded from the existing
+binary-only `#SDSUM` byte total. Use a new session code/output directory per run.
+See [the participant-readiness contract](../docs/participant-readiness-2026-09-28.md).
+
 Use `bench_acquisition.py` with the ADCs attached; analog sensor inputs may be
 disconnected. It refuses to start if the device is recording or reports mounted
 SD storage. It does not flash, reset, format, download, or modify the monitor app.

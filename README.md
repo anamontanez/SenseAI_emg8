@@ -150,13 +150,12 @@ Modes can be switched at runtime via UART without rebooting. The reed switch tog
 
 | Color | Meaning |
 |-------|---------|
-| Dim green/blue cycle | Idle, no host command received since boot |
+| Slow green/blue cycle | Healthy idle |
 | Blue | Wi-Fi AP active while stopped |
-| Orange | UART command received since boot; Wi-Fi off and stopped |
-| Green | Recording |
-| Orange blink | Start countdown |
-| Bright purple | ADC fault |
-| Bright red, 2 flashes/second | SD unavailable, I/O failure, or recording data lost; details on UART |
+| Orange, expires after 3 s | Recent UART command; Wi-Fi off and stopped |
+| Bright green | Recording |
+| Cyan-blue pulse | Start countdown |
+| Steady bright red | SD or ADC fault; details on UART |
 
 The radio and UART colors show firmware state, not a physical link check. SD
 fault colors take precedence over recording and connection colors. The LED is
@@ -210,6 +209,8 @@ The firmware emits a mix of:
 | `Psweep` | `Psweep\n` | Repeat the auxiliary impedance sweep while recording in REST |
 | `P?` | `P?\n` | Query session phase |
 | `L<id>,<rep>` | `L7,3` | Set current grasp label and repetition |
+| `J<subject>,<session>` | `JS023,sS023_n1_20260929_100000\n` | Arm a participant/session tag for the next SD recording |
+| `J?` / `J-` | `J?\n` | Query identity / explicitly return to untagged free recording |
 | `F` | `F` | List files on the SD card |
 | `G<path>` | `Gs_AABBCCDDEEFF_1713012345/R000.bin` | Transfer one file as raw binary |
 
@@ -367,6 +368,27 @@ promise of a 500 ms wall-clock bound.
 See [the September robustness review](docs/robustness-2026-09.md) for the new
 UART event fields, host integration, remaining acquisition work, and required
 hardware acceptance tests before participant use.
+
+### Participant identity on SD
+
+Movement labels are separate from participant identity. Send
+`J<subject>,<session>\n` while stopped and wait for
+`#IDENTITY:ARMED,<subject>,<session>`. A tagged start syncs `Jnnn.json` before
+acquisition and emits `#SESSION:<subject>,<session>,<file-set>` before `#REC`.
+The JSON includes firmware ELF SHA256, settings and the exact binary file set.
+It says `prepared`, not completed; retain `#SDSUM:...,OK` as the close result.
+Its bytes are excluded from the four-binary-file `#SDSUM` total.
+
+After opting in, each successful start consumes the tag and a new recording
+requires another explicit tag. Aborted/failed starts retain it for retry.
+`J-\n` restores free recording; reboot clears the selection. Changes during
+countdown or recording are rejected. Subject/session codes allow ASCII letters,
+digits, `_`, `-`, `.` (32/64 characters respectively). The monitor must confirm
+identity on every participant recording; no monitor changes are included.
+`?` reports `#IDENTITY` and `#FIRMWARE:ELF_SHA256=...`.
+
+See [the participant-readiness review and monitor contract](docs/participant-readiness-2026-09-28.md)
+for the complete handshake, evidence, capacity planning and acceptance tests.
 
 ## WiFi / UDP Streaming
 

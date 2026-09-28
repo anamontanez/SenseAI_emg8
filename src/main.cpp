@@ -45,6 +45,7 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_attr.h"     // IRAM_ATTR (button ISR)
 #include "driver/uart.h"
@@ -168,6 +169,7 @@ static constexpr uint16_t kIMU_ODR_HZ = 200;      // IMU polling rate
 #include "companion_rx.hpp"
 #include "emg8_types.hpp"   // Sample / ImuSample / LabelEvent (shared with net_stream)
 #include "recording_clock.hpp"
+#include "recording_identity.hpp"
 #include <cstdarg>
 #include "net_stream.hpp"
 
@@ -271,6 +273,9 @@ static std::atomic<uint32_t> imuDrops{0};
 
 // Device MAC as hex string  "AABBCCDDEEFF\0"
 static char macStr[13] = {};
+static char firmwareElfSha[65] = {};
+static RecordingIdentitySelection nextIdentity;  // main-task owned
+static RecordingIdentity recordingIdentity;     // fixed before SD Open; immutable until Close
 
 // Session directory path (set once at SD init)
 static std::string sessionDir;
@@ -371,6 +376,12 @@ static const char* resetReasonName(esp_reset_reason_t reason) {
  * line after a reset and is the quickest way to separate a firmware panic or
  * watchdog from a power interruption/brownout. */
 static void printBootDiagnostics() {
+    const auto* app = esp_app_get_description();
+    constexpr char hex[] = "0123456789abcdef";
+    for (unsigned i = 0; i < sizeof(app->app_elf_sha256); ++i) {
+        firmwareElfSha[2 * i] = hex[app->app_elf_sha256[i] >> 4];
+        firmwareElfSha[2 * i + 1] = hex[app->app_elf_sha256[i] & 15];
+    }
     esp_reset_reason_t reason = esp_reset_reason();
     printf("#BOOT:reset=%s(%d),heap=%u,minheap=%u\n",
            resetReasonName(reason), (int)reason,
@@ -428,6 +439,12 @@ static void printBuildConfig() {
 #endif
     printf("#CONFIG:I2C=%s,RDY=%d/%d/%d/%d,COMPANION_CORE=0\n",
            i2c, (int)kRDY[0], (int)kRDY[1], (int)kRDY[2], (int)kRDY[3]);
+    printf("#FIRMWARE:ELF_SHA256=%s\n", firmwareElfSha);
+}
+
+static void printIdentityConfig() {
+    printf("#IDENTITY:%s,%s,%s\n", nextIdentity.state(),
+           nextIdentity.value.subject, nextIdentity.value.session);
 }
 
 static void printCompactStatus() {
@@ -463,6 +480,7 @@ static void printCompactStatus() {
 static void printStatusLine() {
     printCompactStatus();
     printBuildConfig();
+    printIdentityConfig();
     printf("#PHASE:%s\n", phaseName(currentPhase));
     companionPrintStats();
     printf("#SDIO:WRITE_MAX_US=%lu,SYNC_MAX_US=%lu\n",
@@ -641,6 +659,37 @@ static void sdCloseChecked(FIL* file, const char* name) {
 
 static void sdCloseFiles();
 
+static bool sdWriteIdentity(const std::string& path) {
+    // All work happens during preflight, before acquisition. Reuse the closed
+    // master handle rather than putting FatFs's sector cache on the task stack.
+    char json[640]{};
+    const int size = snprintf(json, sizeof(json),
+        "{\"schema\":\"emg8.identity.v1\",\"state\":\"prepared\","
+        "\"subject\":\"%s\",\"session\":\"%s\",\"file_set\":\"%s\","
+        "\"firmware_elf_sha256\":\"%s\",\"mode\":%u,\"rate\":\"%s\","
+        "\"countdown_seconds\":%d}\n",
+        recordingIdentity.subject, recordingIdentity.session, sdFileSet.c_str(),
+        firmwareElfSha, (unsigned)mode, recordingRate1000.load() ? "1000" : "max",
+        countdownSeconds);
+    if (size < 0 || size >= (int)sizeof(json)) {
+        sdOK = false;
+        sdFault = SdFault::Metadata;
+        printf("#ERR:SD_IDENTITY_SIZE\n");
+        return false;
+    }
+    const FRESULT opened = f_open(&filMaster, path.c_str(), FA_CREATE_NEW | FA_WRITE);
+    if (opened != FR_OK) {
+        sdOK = false;
+        sdFault = SdFault::Open;
+        printf("#ERR:SD_IDENTITY_OPEN:%d\n", (int)opened);
+        return false;
+    }
+    const bool ok = sdWriteChecked(&filMaster, "J", json, (UINT)size) &&
+                    sdSyncChecked(&filMaster, "J");
+    sdCloseChecked(&filMaster, "J");
+    return ok && sdOK;
+}
+
 static bool sdOpenFiles(const std::string& base) {
     // One file set per recording start (R000.bin, R001.bin, ...) so a
     // pause/resume or stop/start never truncates earlier data.
@@ -651,6 +700,12 @@ static bool sdOpenFiles(const std::string& base) {
     sdRecordingStarted = false;
     sdRawRecords = sdEnvRecords = sdImuRecords = 0;
     sdBytes = 0;
+    if (recordingIdentity.subject[0]) {
+        char identitySuffix[16];
+        snprintf(identitySuffix, sizeof(identitySuffix), "%03u.json", (unsigned)(recIndex - 1));
+        if (!sdWriteIdentity(base + "/J" + identitySuffix)) return false;
+    }
+    // Keep #SDSUM bytes backward compatible: the four binary files only.
     std::string mPath = base + "/M" + suffix;
     std::string rPath = base + "/R" + suffix;
     std::string ePath = base + "/E" + suffix;
@@ -1514,6 +1569,16 @@ static bool startRecording() {
         updateStatusLed();
         return false;
     }
+    if (!nextIdentity.canStart()) {
+        printf("#ERR:IDENTITY_REQUIRED\n#STOP\n");
+        return false;
+    }
+#ifdef EMG8_NO_SD
+    if (nextIdentity.armed) {
+        printf("#ERR:IDENTITY_REQUIRES_SD\n#STOP\n");
+        return false;
+    }
+#endif
     // Validate the intended channels before making a session directory,
     // starting the auxiliary, or acknowledging #REC. startADCs() rebuilds
     // this configuration after the countdown (sensor selection may change).
@@ -1532,6 +1597,7 @@ static bool startRecording() {
         return false;
     }
     recordingRate1000.store(limitFastRate1000, std::memory_order_relaxed);
+    recordingIdentity = nextIdentity.value;
     resetDropCounters();
 #ifndef EMG8_NO_SD
     if (!commandSdWriter(SdCommand::Open)) {
@@ -1570,8 +1636,19 @@ static bool startRecording() {
         printf("#STOP\n");
         return false;
     }
-    saveMetadata(3, currentPhase, curGrasp, curRep, 0);
-    saveMetadata(4, currentPhase, 0, 0, 0);
+    if (!saveMetadata(3, currentPhase, curGrasp, curRep, 0) ||
+        !saveMetadata(4, currentPhase, 0, 0, 0)) {
+        sdFault = SdFault::Metadata;
+        recording = false;
+        stopCompanion(true);
+        waitImuIdle();
+        sdRecordingStarted = false;
+        commandSdWriter(SdCommand::Close);
+        printSdSummary();
+        updateStatusLed();
+        printf("#STOP\n");
+        return false;
+    }
     if (!startADCs()) {
         if (recording) {
             recording = false;
@@ -1587,6 +1664,10 @@ static bool startRecording() {
     }
     updateStatusLed();
     if (sdOK) printf("#SD:OK,%s,0\n", sdFileSet.c_str());
+    if (recordingIdentity.subject[0])
+        printf("#SESSION:%s,%s,%s\n", recordingIdentity.subject,
+               recordingIdentity.session, sdFileSet.c_str());
+    nextIdentity.consume();
     printf("#TSWRAP:0,0\n");
     printf("#REC\n");
     return true;
@@ -1811,6 +1892,7 @@ static void checkStartButton() {
 
 static char uartLineBuf[128];
 static int  uartLinePos = 0;
+static bool uartLineInvalid = false;
 
 static bool parseLabel(const char* text, uint16_t& grasp, uint16_t& repetition) {
     auto field = [&text](uint16_t& result) {
@@ -1830,7 +1912,15 @@ static bool parseLabel(const char* text, uint16_t& grasp, uint16_t& repetition) 
 static void processUartLine(const char* line, int len) {
     if (len < 1) return;
 
-    if (line[0] == 'C') {
+    if (line[0] == 'J') {
+        if (strcmp(line, "J?") == 0) printIdentityConfig();
+        else if (recording || starting) printf("#ERR:BUSY\n");
+        else if (strcmp(line, "J-") == 0) {
+            nextIdentity.clear();
+            printIdentityConfig();
+        } else if (nextIdentity.set(line + 1, len - 1)) printIdentityConfig();
+        else printf("#ERR:IDENTITY:USE_Jsubject,session\n");
+    } else if (line[0] == 'C') {
         if (strcmp(line, "C?") == 0) {
             printf("#CDCFG:%d\n", countdownSeconds);
             return;
@@ -1964,25 +2054,33 @@ static void processUartLine(const char* line, int len) {
 
 /** Feed one byte to the UART line accumulator. Returns single-char cmds. */
 static int feedUartByte(uint8_t b) {
-    // Multi-byte commands start with 'L', 'G', 'R', 'P', 'C' and end with '\n'
+    // Line commands end with CR/LF. Never execute a truncated or binary line.
     if (uartLinePos > 0) {
         // We're accumulating a line
         if (b == '\n' || b == '\r') {
             uartLineBuf[uartLinePos] = '\0';
-            processUartLine(uartLineBuf, uartLinePos);
+            if (uartLineInvalid) {
+                if (uartLineBuf[0] == 'J' && !recording && !starting)
+                    nextIdentity.set("", 0); // disarm a stale participant tag
+                printf("#ERR:COMMAND_LINE\n");
+            } else processUartLine(uartLineBuf, uartLinePos);
             uartLinePos = 0;
+            uartLineInvalid = false;
             return 0;   // consumed
         }
+        if (b < 32 || b > 126) uartLineInvalid = true;
         if (uartLinePos < (int)sizeof(uartLineBuf) - 1)
             uartLineBuf[uartLinePos++] = (char)b;
+        else uartLineInvalid = true;
         return 0;   // consumed
     }
 
     // First byte of a potential command
-    if (b == 'L' || b == 'G' || b == 'R' || b == 'P' || b == 'C') {
+    if (b == 'L' || b == 'G' || b == 'R' || b == 'P' || b == 'C' || b == 'J') {
         uartLastCommandMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
         uartLineBuf[0] = (char)b;
         uartLinePos = 1;
+        uartLineInvalid = false;
         return 0;
     }
 
