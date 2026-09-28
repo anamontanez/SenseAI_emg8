@@ -2009,3 +2009,13 @@ metrics are in benchmarks/robustness-2026-09-28/review-metrics-2026-09-28.json.
 Remaining before participant use: monitor handshake/results integration, two
 tagged SD readbacks and a complete protocol test on the actual station. At the
 Saturday duration, 300 sessions imply ~14.5 GB plus retries and 57 device-hours.
+
+## 2026-09-28 — Astra to Luna validation handoff
+
+Prepared docs/luna-handoff-2026-09-28.md with the exact archived candidate,
+verified image hashes, app-only flash command, two short tagged SD readbacks,
+identity/cancellation rejection tests and the subsequent full monitor protocol.
+Flagged the stale lifecycle harness (missing sd_summary), COM availability,
+single UDP-subscriber behavior and UART readback time. No additional firmware
+changes, flash, or serial-port access during this handoff. Candidate remains
+2d58cb9, built with 47 offline tests passing; hardware acceptance is pending.
