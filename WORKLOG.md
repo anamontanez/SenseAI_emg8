@@ -1909,3 +1909,40 @@ matching the unprefixed `F` listing. Fixed that host-side path normalization
 and added a regression test; all 14 `test_bench_sd.py` tests pass, and the
 already-downloaded files now verify successfully. Capture:
 `benchmarks/robustness-2026-09-28/sd-readback-smoke/`.
+
+With the phone USB tether available, the combined SD+UDP test ran successfully.
+The 30-second capture had no UDP packet gaps; SD read-back exactly matched
+239,971 raw, 11,996 envelope, and 5,420 IMU records, with zero ADC or storage
+drops. Two 60-second repeats both closed with `#SDSUM:...,OK` and exact
+read-back. They saved 479,609 / 479,692 raw, 23,976 / 23,984 envelope, and
+10,363 / 10,658 IMU records. ADC I2C errors, retriggers, and storage drops
+were zero in all three runs.
+
+The 60-second UDP results varied: the first receiver missed six raw and one
+envelope packet (99.784% ADC-record delivery), and the repeat missed one raw
+and one IMU packet (99.965%). Firmware counters showed 3,834 and 3,836 sends
+with zero send errors, queue drops, or network throttles. Every UDP record was
+present in SD; SD contained 1,044 raw + 44 envelope records absent from UDP in
+the first run, and 174 raw + 11 IMU records absent in the repeat. The host
+receiver used a 1 MiB socket buffer and drained continuously. This localizes
+these intermittent gaps to after firmware send accounting, but does not
+separate Wi-Fi/AP delivery loss from host network-driver loss. The 30-second
+combined capture had no gaps. All captures are under
+`benchmarks/robustness-2026-09-28/`.
+
+Saved sample timestamps measured 998.4–999.9 raw samples/s on several channels
+in the 1000 setting, with envelope at 49.92–50.00 Hz. The separate 30-second
+SD-only `max` run measured 1,015.0–1,015.9 raw samples/s, 50.76–50.79 Hz
+envelope, and 199.86 Hz IMU; its SD read-back was exact with zero drops. Thus
+the ADC path can exceed 1 kHz, while the controlled 1000 setting is marginally
+under a literal 1000 Hz minimum. No code change was made pending the distinction
+between a strict 1000 Hz ceiling and a nominal minimum.
+
+IMU ran at 172.97 and 177.59 Hz during combined SD+UDP tests, with zero IMU
+read errors and no queue drops; SD-only `max` reached 199.86 Hz. SD writer
+priority 5 and IMU priority 4 share core 1, and sampled raw-queue peaks rose to
+602 and 1,502 during the combined runs. Maximum SD write times were 194.9 ms
+and 267.2 ms. This is consistent with the IMU task losing time to higher-
+priority storage work, but we left the scheduler unchanged to protect the
+primary raw/SD path. The board finished idle with the SD mounted. Ana's
+auxiliary firmware and the monitor were not modified.

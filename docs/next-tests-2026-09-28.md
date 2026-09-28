@@ -328,14 +328,64 @@ drops, and file sizes matching all reported record counts. Details and captures
 are in `WORKLOG.md` and `benchmarks/robustness-2026-09-28/`.
 
 The firmware-side directory listing verified file names and lengths. The
-binary files were then downloaded and decoded on the host by the SD read-back
-harness; counts, monotonic timestamps, metadata, and byte totals match. The
-harness had a small `0:` FatFs volume-prefix mismatch when matching the
-firmware summary to the directory listing; that normalization is fixed and its
-14 focused tests pass. The read-back was an SD-only run, so it does not test
-UDP delivery. The next test should combine SD and UDP, then compare saved
-records to received packets. That harness was attempted but Windows denied
-reconnecting to the saved bracelet Wi-Fi profile with `WlanQueryInterface`
-error 5 (elevation required), so it stopped before starting a recording. No
-UDP result is available yet. The ADC inputs were open throughout these tests,
-so no electrode signal-quality claim is possible.
+binary files were downloaded and decoded by the SD read-back harness; counts,
+monotonic timestamps, metadata, and byte totals matched. Its `0:` FatFs
+volume-prefix normalization is fixed, with 14 focused tests passing. The first
+SD+UDP attempt was blocked by Windows WLAN permissions; after the phone USB
+tether was connected, combined captures and direct SD/UDP comparisons completed.
+The ADC inputs were open throughout, so these runs establish transport and
+storage behavior, not electrode signal quality.
+
+## Integrated SD+UDP soak results — 2026-09-28
+
+The 30-second SD+UDP capture completed at the 1000 setting with no UDP sequence
+gaps, no ADC I2C errors/retriggers, and an exact SD read-back. It saved 239,971
+raw, 11,996 envelope, and 5,420 IMU records. The firmware reported 1,920 UDP
+sends, zero send errors, and zero queue drops. Captures are in
+`benchmarks/robustness-2026-09-28/sd-udp-30s-tether/`.
+
+Two 60-second SD+UDP captures also closed with `#SDSUM:...,OK`. Each new
+`M/R/E/I` file set was downloaded over UART and matched the firmware's record
+counts and byte total. Neither run reported ADC errors, retriggers, or storage
+drops, and every UDP record was present on SD. The first run saved 479,609 raw,
+23,976 envelope, and 10,363 IMU records; its receiver missed six raw and one
+envelope datagram. The repeat saved 479,692 raw, 23,984 envelope, and 10,658
+IMU records; its receiver missed one raw and one IMU datagram. Thus the SD
+records absent from UDP were respectively `[1044, 44, 0]` and `[174, 0, 11]`
+for raw/envelope/IMU; no UDP-only records were found.
+
+The firmware's successful-send counters were 3,834 and 3,836, with `ERR=0` and
+`DROP=0`; the host captured 3,827 and 3,834 datagrams. These whole-packet
+sequence gaps are therefore after the firmware's send/queue accounting. The
+host harness used a 1 MiB UDP receive buffer and continuously drained it, so the
+remaining candidates are the Wi-Fi/AP path or host network delivery. The test
+does not distinguish those two without receiver/driver drop telemetry. The
+delivery fractions for ADC records were 99.784% and 99.965%; a short display
+interpolation can mask visual gaps, but must not label reconstructed values as
+measured or saved samples.
+
+Reading timestamps directly from the saved files puts the 1000 setting at
+about 998.4–999.9 raw samples/s on several channels and 49.92–50.00 envelope
+samples/s. This is close to the target but falls slightly below a literal
+1000 Hz minimum. A separate 30-second SD-only `max` run produced 1,015.0–
+1,015.9 raw samples/s and 50.76–50.79 envelope samples/s, with 5,983 IMU
+records, an `OK` close, exact read-back, and no drops. This confirms the ADC
+path can exceed 1 kHz; the current cap stays unchanged until deciding whether
+the `1000` setting means a hard ceiling or a nominal minimum.
+
+IMU remained error-free but averaged 172.97 and 177.59 Hz in the two combined
+runs, below its 200 Hz target but above the practical 100 Hz floor. The
+standalone SD-only `max` run measured 199.86 Hz. The SD writer is priority 5 on
+core 1 while IMU is priority 4 on the same core; the longer combined runs also
+sampled raw-queue peaks of 602 and 1,502 entries, and maximum SD writes of
+194.9 ms and 267.2 ms. That scheduling and I/O load plausibly explains the IMU
+shortfall, but no priority change was made because raw acquisition and SD
+integrity remain higher priorities.
+
+Useful next checks are to keep sequence-gap metrics visible in the monitor,
+decide whether the nominal 1000 mode may run a fraction above 1000 to guarantee
+a measured minimum, and only tune IMU scheduling if 200 Hz becomes mandatory.
+No firmware, auxiliary-controller, or monitor source was changed for these
+tests. The board finished idle with the SD mounted and the run artifacts are
+under `benchmarks/robustness-2026-09-28/sd-udp-60s-tether/`,
+`sd-udp-60s-repeat/`, and `sd-max-30s/`.
