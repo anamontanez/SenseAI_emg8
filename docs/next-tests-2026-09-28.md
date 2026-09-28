@@ -316,3 +316,22 @@ initialization failure was fixed earlier; WORKLOG records this card mounting
 and `test.txt` being read successfully afterward. The current failure is a
 separate, later FAT-volume geometry problem. No repair, format, or SD write was
 performed. Before any repair, decide whether files on the card need recovery.
+
+## Post-format test status — 2026-09-28
+
+The operator authorized a quick FAT32 format after Windows also reported an
+unrecognized filesystem. Windows now reports a ready, read/write 15 GiB FAT32
+volume labeled `EMG8`. After reinsertion and a physical reset, the firmware
+reported `SD_READY` and `READY,NONE`. A 30-second SD-only run at the 1000 Hz
+cap completed with an `OK` close summary, zero ADC I2C errors/retriggers/queue
+drops, and file sizes matching all reported record counts. Details and captures
+are in `WORKLOG.md` and `benchmarks/robustness-2026-09-28/`.
+
+The firmware-side directory listing verified file names and lengths; the binary
+files have not yet been retrieved and decoded on the host. The next test should
+combine SD and UDP, then compare saved records to received packets. That harness
+was attempted but Windows denied reconnecting to the saved bracelet Wi-Fi
+profile with `WlanQueryInterface` error 5 (elevation required), so it stopped
+before starting a recording. No UDP result is available yet. The ADC inputs
+were open throughout these tests, so no electrode signal-quality claim is
+possible.

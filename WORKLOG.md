@@ -1863,3 +1863,35 @@ recognizes the volume as ready, read/write FAT32 with 16,087,252,992 total bytes
 the authorized quick format. Firmware-side boot-sector geometry and mount are
 still unverified; next, reinsert it in the bracelet and run the existing
 read-only `D` diagnostic, then verify mount before attempting a recording.
+
+After the authorized FAT32 quick format, the operator reinserted the card and
+pressed the board's physical reset because the CP210x enumerated before the
+ESP32 had started. A read-only UART query on COM5 then reported
+`#SDDIAG:SKIP,SD_READY`, `#STATUS:0,0,1,1,...`, and `#SDSTATE:READY,NONE`.
+This confirms firmware initialization and mount on the reformatted card.
+
+With all eight ADC channels open (no sEMG sensors) and the IMU attached, ran a
+5-second smoke recording and a 30-second SD-only soak at the 1000 Hz cap, each
+after the configured 10-second countdown. Both produced `#SDSUM:...,OK`; the
+30-second run saved 240,147 raw, 12,002 envelope, and 5,995 IMU records
+(2,137,160 bytes including the 68-byte master file). Per-ADC raw counts were
+30,015–30,020 and envelope counts 1,500–1,501; all I2C error and retrigger
+counters were zero. IMU count corresponds to about 200 Hz. Thirty-one health
+samples reported no queue drops; sampled queue occupancy peaked at 296 raw,
+14 envelope, and 4 IMU entries. The file listing independently confirmed
+`M001.bin` 68 bytes, `R001.bin` 1,921,176 bytes, `E001.bin` 96,016 bytes,
+and `I001.bin` 119,900 bytes, matching the summary and record widths exactly.
+The run's maximum observed SD write and sync durations were 105,750 us and
+71,006 us. These short, open-input tests validate mount, write, and close but
+do not validate electrode signals or long-term durability. ESP-IDF logged
+repeated “GPIO ISR service already installed” messages during startup; the
+button and ADC code explicitly tolerate this shared-service condition, and
+acquisition completed with zero reported I2C errors, retriggers, or drops.
+Captures are under `benchmarks/robustness-2026-09-28/`.
+
+The follow-on 30-second SD+UDP harness did not start a recording: Windows
+refused the saved bracelet Wi-Fi reconnect with `WlanQueryInterface` error 5
+(elevation required). The harness cleanup stopped Wi-Fi, and the final status
+remained idle with SD ready. No UDP delivery result was obtained. Retry only
+after the host can join the saved `EMG8-24EC4A368770` profile; the isolated
+failure is on the laptop's Wi-Fi control path, not an SD or firmware result.
