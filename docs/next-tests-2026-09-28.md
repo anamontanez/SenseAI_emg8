@@ -280,15 +280,31 @@ view.
 ## Follow-up read-only register probe
 
 Added a stopped-state CMD10/CMD9 reread through ESP-IDF's decoded CID/CSD
-helpers. On mount failure, the diagnostic reports manufacturer/product ID and
-serial plus the initialization-time and freshly decoded capacity values; it
-still reads only identification registers and filesystem-identifying sectors.
-Build and upload succeeded on COM5, with 72,996 bytes static RAM and 949,014
-bytes flash (BIN SHA256
-`B18BBB2FF2FC033CF0A5B93862B14C080C5EDF6274F1CA6F3A9C84CBE8FB2AC2`, ELF
-SHA256 `1DB0FF833832E0813F6C5D89184577DACF51C0513A7AA6CE429F4252B9891771`).
-A UART `?` query after upload confirms idle mode and `FAILED,MOUNT`; its capture
-is `benchmarks/robustness-2026-09-28/sd-status-after-csd-flash.jsonl`. That
-query did not reset the board, so it does not contain startup `#SDREG` lines.
-Capture those on the next operator power cycle, then compare the reported
-15 GiB CSD capacity with Windows before any card repair.
+helpers and an idle-only UART `D` command to invoke the same diagnostic on
+demand. It reports manufacturer/product ID and serial plus initialization-time
+and freshly decoded capacity; it reads only identification registers and
+filesystem-identifying sectors. Build and upload succeeded on COM5, with
+72,996 bytes static RAM and 949,070 bytes flash (BIN SHA256
+`D93377E2D01C19F54B1FD8A3282936C3FB3EFD9D318D568B0A23AA4EE561C0E4`, ELF
+SHA256 `615939BCB9C4E9C0DF00C78F45CFE7E4B004DA38E255DB6EBAD70F63310FD78C`).
+The subsequent `D` response is captured in
+`benchmarks/robustness-2026-09-28/sd-register-ondemand.jsonl`:
+
+- CID read succeeded; decoded manufacturer ID 5, OEM ID 12, product name
+  `asdfg`, revision 34, and serial `0x0000955E`.
+- CSD reread succeeded and again reported 31,457,280 sectors × 512 bytes
+  (15 GiB), exactly matching the capacity from card initialization.
+- MBR partition type `0x0C`, start LBA 2048, length 31,453,184 sectors fits
+  that capacity. Two reads of both LBA 0 and LBA 2048 matched.
+- The FAT32 boot record at LBA 2048 still declares 132,116,480 sectors (about
+  63 GiB), over four times its partition and the card's reported capacity.
+
+This rules out a stale one-time capacity decode or unstable sector read as the
+cause of mount failure. It localizes the current `FR_NO_FILESYSTEM` failure to
+the volume geometry exposed to FatFs. A following status query still reports
+idle mode and `FAILED,MOUNT`; its capture is
+`benchmarks/robustness-2026-09-28/sd-status-after-diagnostic.jsonl`. The result
+does not establish why Windows created or sees that geometry, so compare
+Windows' physical-card and volume sizes without writing or formatting before
+any repair. The `D` command avoids startup-capture timing issues on later
+checks.

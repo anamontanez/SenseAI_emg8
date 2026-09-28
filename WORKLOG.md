@@ -1826,15 +1826,20 @@ Next check: compare the card's reported physical capacity and Windows volume
 size without writing; collect more card identity/geometry evidence before
 deciding on a backed-up reformat or replacement.
 
-A read-only register probe now rereads CID and CSD after the mount failure,
-printing card identity and fresh CSD capacity beside the initialized sector
-count. All 41 host checks pass, the storage image built and was uploaded to
-COM5, and a status query still reports idle `FAILED,MOUNT`. No recording
-command was sent and no SD file was opened. The uploaded image uses 72,996
-bytes static RAM and 949,014 bytes flash (BIN SHA256
-`B18BBB2FF2FC033CF0A5B93862B14C080C5EDF6274F1CA6F3A9C84CBE8FB2AC2`). The
-status-only capture is
-`benchmarks/robustness-2026-09-28/sd-status-after-csd-flash.jsonl`; its startup
-register lines require one operator power cycle because the upload reset
-preceded the serial capture. After that, compare the CSD identity/capacity with
-Windows' physical-device and volume sizes before deciding on any repair.
+A read-only register probe rereads CID and CSD after the mount failure. Since
+startup output was missed, added idle-only UART command `D` to invoke that same
+diagnostic without another manual reset. All 41 host checks pass; build and
+upload succeeded on COM5. The `D` response (`sd-register-ondemand.jsonl`) shows
+the freshly decoded CSD capacity exactly matches initialization at 31,457,280
+512-byte sectors. MBR partition type `0x0C`, start 2048, length 31,453,184
+sectors fits the card, but the FAT32 boot record declares 132,116,480 sectors.
+The LBA 0 and LBA 2048 reads were each stable across two reads. No recording
+command was sent and no SD file was opened or written. The image uses 72,996
+bytes static RAM and 949,070 bytes flash (BIN SHA256
+`D93377E2D01C19F54B1FD8A3282936C3FB3EFD9D318D568B0A23AA4EE561C0E4`). This
+reproduces the volume-geometry mismatch at the device and explains the
+`FR_NO_FILESYSTEM` mount failure; it does not prove whether Windows displays a
+different card size. Captures are `sd-register-ondemand.jsonl` and
+`sd-status-after-diagnostic.jsonl` under the robustness benchmark directory.
+Compare Windows' physical-device and volume sizes before considering repair or
+formatting.

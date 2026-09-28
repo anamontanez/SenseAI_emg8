@@ -18,7 +18,8 @@
  *   I<nnn>.bin — IMU      (20-byte ImuSample records)
  *
  * UART baud 460800.  Protocol:
- *   PC→ESP: '0' stop · '1-4' mode · 'S<0-7>' sensor · '?' status · 'L<id>,<rep>\n' label
+ *   PC→ESP: '0' stop · '1-4' mode · 'S<0-7>' sensor · '?' status · 'D' SD diagnostic
+ *           'L<id>,<rep>\n' label
  *           'V0'/'V1' 5V · 'F' list files · 'G<path>\n' transfer file
  *   ESP→PC: #READY · #MODE:N · #CD:N · #REC · #STOP · #LABEL:id,rep
  *           #STATUS:mode,rec,sd,imu,mV,%,rawDrops,envDrops,imuDrops
@@ -1985,8 +1986,8 @@ static int feedUartByte(uint8_t b) {
     }
 
     // Single-byte commands
-    if ((b >= '0' && b <= '4') || b == '?' || b == 'S' || b == 'V' ||
-        b == 'U' || b == 'W' || b == 'F') uartHostSeen = true;
+    if ((b >= '0' && b <= '4') || b == '?' || b == 'D' || b == 'S' ||
+        b == 'V' || b == 'U' || b == 'W' || b == 'F') uartHostSeen = true;
     return b;
 }
 
@@ -2289,6 +2290,10 @@ extern "C" void app_main() {
             else if (cmd == 'S') handleSensorCommand();
             else if (cmd == '?') {
                 printStatusLine();
+            }
+            else if (cmd == 'D') {
+                if (sdOK) printf("#SDDIAG:SKIP,SD_READY\n");
+                else diagnoseSdMount();
             }
             else if (cmd == 'V') {
                 // Read next byte for V0/V1

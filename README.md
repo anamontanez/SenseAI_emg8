@@ -200,6 +200,7 @@ The firmware emits a mix of:
 | `R?` | `R?\n` | Query selected sampling rate |
 | `C1`–`C30` / `C?` | `C10\n` | Set/query the next start countdown in seconds; default 10 |
 | `?` | `?` | Query current status |
+| `D` | `D` | While idle, rerun read-only SD CID/CSD and partition/boot-sector diagnostics |
 | `V1` | `V1` | Enable 5V rail |
 | `V0` | `V0` | Disable 5V rail |
 | `W1` | `W1` | Enable WiFi SoftAP + UDP streaming |
@@ -219,6 +220,7 @@ Command notes:
 - `C1`–`C30` applies to the next start and returns `#CDCFG:<seconds>`; changing it while recording returns `#ERR:BUSY`. The setting resets to 10 seconds on reboot. Countdown ticks use elapsed time and remain cancellable with `0`.
 - `G<path>` is rejected while recording is active and returns `#ERR:BUSY`.
 - `F` and `G` require a mounted SD card. Otherwise the device returns `#ERR:NO_SD`.
+- `D` reads card registers and filesystem-identifying sectors only. It is available in idle mode and never formats or writes to the card.
 
 ### Sampling rate selection
 
