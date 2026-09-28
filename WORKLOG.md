@@ -1778,3 +1778,20 @@ disagreeing with the auxiliary's state.
 Host suite: 28 checks passed. The `esp32-s3-storage-bench` image built
 successfully (72224 bytes static RAM, 934298 bytes flash). COM9 was absent
 at the final port check, so this image was not flashed or hardware-tested.
+
+## 2026-09-28 - Review of robustness deployment and next-test plan
+
+Reviewed `229a9b0`, the September 27 conversation's build/serial evidence,
+participant timing tables, installed FatFs code and current bench tools.
+The build passed 34 host checks and ran on bench board 24EC4A368770 via COM5.
+ADC and IMU initialization passed. SD initialization reached the mount stage,
+which returned FR_NO_FILESYSTEM (13); a requested start retried and was refused.
+No sustained SD+UDP recording was validated on this build. The error does not
+establish a faulty card; inspect its layout/sector data before changing it.
+
+Found an untested restart bug: the first failed/cancelled start resets mode to
+Idle, then a reed retry can acknowledge recording with no configured ADCs.
+Also found test limitations: fixed one-second stop wait, no SDSUM verification,
+and modulo-based UDP summaries that cannot validate a run longer than one wrap.
+No firmware or device changes in this review. The implementation order, evidence
+requirements and monitor handoff are in `docs/next-tests-2026-09-28.md`.
