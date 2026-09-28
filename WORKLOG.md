@@ -1795,3 +1795,22 @@ Also found test limitations: fixed one-second stop wait, no SDSUM verification,
 and modulo-based UDP summaries that cannot validate a run longer than one wrap.
 No firmware or device changes in this review. The implementation order, evidence
 requirements and monitor handoff are in `docs/next-tests-2026-09-28.md`.
+
+The planned start guard, production ADC-plan validation, read-only SD sector
+diagnostics, and bounded/file-level bench checks were then implemented. All 40
+host checks pass, including a simulated close delayed over one second.
+`esp32-s3-storage-bench` built at 72,996 bytes static RAM and
+948,834 bytes flash, then was flashed to the same board on COM5 (BIN SHA256
+`F11273B2D0F13FA11A5AB34A476E0C36694DDE6E88579DF444DF752F7B5A68E9`). Five
+start retries retained mode All and consistently reached `FR_NO_FILESYSTEM`
+(13); each was refused before a recording opened. The two latest checks held
+steady at 122,732 free heap bytes.
+
+Read-only sector evidence shows the card advertises 15 GiB, while its FAT32
+partition boot sector claims about 63 GiB despite an MBR partition size that
+fits the card. Two consecutive reads of each inspected sector matched on every
+retry. The current failure is therefore localized to inconsistent volume
+geometry rather than transient reads; no SD+UDP or sampling-rate acceptance
+run was performed without a mountable card. Full evidence and the next card
+comparison step are in `docs/next-tests-2026-09-28.md` and the ignored
+`benchmarks/robustness-2026-09-28/` captures.

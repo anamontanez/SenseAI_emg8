@@ -95,6 +95,9 @@ class Card:
 
 def verify(folder, files, capture):
     summary = json.loads((capture / 'summary.json').read_text())
+    saved = summary.get('sd_summary')
+    assert saved is not None, 'Missing firmware #SDSUM from capture'
+    assert saved.get('result') == 'OK', saved
     disk = [collections.Counter() for _ in range(3)]
     counts = collections.Counter()
     last = {}
@@ -148,6 +151,14 @@ def verify(folder, files, capture):
     for adc, values in summary['counts'].items():
         for ch in range(4):
             assert counts[int(adc), ch] == values[ch], (adc, ch, counts[int(adc), ch], values[ch])
+    actual_counts = [sum(disk[k].values()) for k in range(3)]
+    reported_counts = [saved['raw'], saved['env'], saved['imu']]
+    assert actual_counts == reported_counts, ('Firmware #SDSUM record counts', reported_counts, actual_counts)
+    actual_bytes = sum((folder / Path(name).name).stat().st_size for name in files)
+    assert actual_bytes == saved['bytes'], ('Firmware #SDSUM byte count', saved['bytes'], actual_bytes)
+    file_dir, file_number = saved['file_set'].rsplit('/', 1)
+    expected_master = file_dir + '/M' + file_number
+    assert expected_master in files, ('Firmware #SDSUM file set', expected_master, files)
     if summary.get('rate') == '1000':
         for (adc, ch), count in counts.items():
             hz = 50 if summary['mode'] == 1 and ch in ENV[adc] else 1000
@@ -180,7 +191,8 @@ def verify(folder, files, capture):
     assert not any(summary['final_status'][6:9]), summary['final_status']
     return {'sd_records': [sum(x.values()) for x in disk], 'udp_absent_from_sd': unexpected,
             'sd_absent_from_udp': missing, 'masters': masters,
-            'adc_counts_match': True, 'storage_drops': summary['final_status'][6:9]}
+            'adc_counts_match': True, 'storage_drops': summary['final_status'][6:9],
+            'sd_summary': saved, 'sd_bytes_match': True}
 
 
 def run(args):

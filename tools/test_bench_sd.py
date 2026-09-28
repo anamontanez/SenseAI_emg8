@@ -36,7 +36,9 @@ class SavedRecords(unittest.TestCase):
             packets += struct.pack('<QH', 0, len(packet)) + packet
         (self.capture / 'udp.bin').write_bytes(packets)
         self.summary = {'mode': 1, 'counts': {str(a): [2, 2, 2, 2, 0, 0] for a in range(4)},
-                        'failure': None, 'final_status': [1, 0, 1, 1, 0, 0, 0, 0, 0]}
+                        'failure': None, 'final_status': [1, 0, 1, 1, 0, 0, 0, 0, 0],
+                        'sd_summary': {'file_set': 's_TEST_0/000.bin', 'raw': 16,
+                            'env': 16, 'imu': 2, 'bytes': 328, 'result': 'OK'}}
         self.write_summary()
 
     def write_summary(self):
@@ -57,6 +59,8 @@ class SavedRecords(unittest.TestCase):
         events = b''.join(struct.pack('<IHHI', *row) for row in
                           [(0, 7, 3, 0x305), (200, 7, 3, 0x204), (300, 8, 4, 0x104)])
         path.write_bytes(header + events)
+        self.summary['sd_summary']['bytes'] += len(events)
+        self.write_summary()
         master = self.check()['masters'][0]
         self.assertEqual((master['event_count'], master['label_count']), (3, 1))
         bad = bytearray(events)
@@ -85,6 +89,8 @@ class SavedRecords(unittest.TestCase):
             for ch in channels:
                 self.summary['counts'][str(a)][ch] = 0
         self.summary['counts']['0'][0] = 40
+        self.summary['sd_summary']['raw'] = 40
+        self.summary['sd_summary']['bytes'] += 24 * 8
         self.write_summary()
         (self.sd / 'R000.bin').write_bytes(
             b''.join(struct.pack('<IBBh', i * 100, 0, 0, 0) for i in range(40)))
@@ -139,6 +145,28 @@ class SavedRecords(unittest.TestCase):
         data[24] = 3
         f.write_bytes(data)
         with self.assertRaises(AssertionError): self.check()
+
+    def test_missing_or_incomplete_firmware_summary_fails(self):
+        self.summary['sd_summary'] = None
+        self.write_summary()
+        with self.assertRaisesRegex(AssertionError, 'Missing firmware'):
+            self.check()
+        self.summary['sd_summary'] = {'file_set': 's_TEST_0/000.bin', 'raw': 16,
+            'env': 16, 'imu': 2, 'bytes': 328, 'result': 'INCOMPLETE'}
+        self.write_summary()
+        with self.assertRaises(AssertionError):
+            self.check()
+
+    def test_wrong_firmware_record_count_or_byte_summary_fails(self):
+        self.summary['sd_summary']['raw'] += 1
+        self.write_summary()
+        with self.assertRaisesRegex(AssertionError, 'record counts'):
+            self.check()
+        self.summary['sd_summary']['raw'] -= 1
+        self.summary['sd_summary']['bytes'] += 512
+        self.write_summary()
+        with self.assertRaisesRegex(AssertionError, 'byte count'):
+            self.check()
 
 
 if __name__ == '__main__':

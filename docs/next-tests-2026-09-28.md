@@ -60,8 +60,8 @@ The new fault LED is bright red in source, but its visibility needs an operator
 check. Repeated `POWERON` boots during the previous capture are not evidence
 of spontaneous power failure: those scripts opened an already-configured
 serial port and then changed DTR/RTS, and some explicitly reset the board.
-Use the existing `serial_capture.py` pattern: set DTR/RTS inactive **before**
-opening, continuously drain UART, and save raw output. Firmware UART is
+Use the safe serial pattern in `tools/bench_acquisition.py`: set DTR/RTS inactive
+**before** opening, continuously drain UART, and save raw output. Firmware UART is
 460800; ROM/early boot uses 115200, explaining the initial garbled bytes.
 
 ## First patch: close the restart hole and improve the evidence
@@ -218,3 +218,52 @@ Use `docs/companion-protocol.md` and `docs/robustness-2026-09.md` as the contrac
 - U0 now suppresses preview CSV/ordinary output; fault/control/save events and
   the auxiliary relay remain available. The monitor contract's older claim
   that U0 silences all UART output needs updating by its owner.
+
+## Deployment results — 2026-09-28
+
+Implemented the failed-start/reed-retry guard, a shared validated ADC channel
+plan, cleanup when ADC startup fails after the companion has started, read-only
+card-sector diagnostics, bounded stop/SDSUM checks in the acquisition harness,
+and file-level validation of the firmware SDSUM. Added host regressions for the
+actual ADC map, Idle rejection, and retry cleanup. The card diagnostic reads
+LBA 0 and plausible partition boot sectors twice through a DMA-capable buffer;
+it does not mount, format, write, or dump file contents.
+
+All 40 host checks pass, including a simulated writer close delayed beyond one
+second and refusal for absent/incomplete save summaries. The
+`esp32-s3-storage-bench` firmware built and was
+flashed to MAC `24:EC:4A:36:87:70` on COM5. Static RAM is 72,996 bytes (22.3%);
+flash is 948,834 bytes (30.2%). BIN SHA256:
+`F11273B2D0F13FA11A5AB34A476E0C36694DDE6E88579DF444DF752F7B5A68E9`; ELF
+SHA256: `789F7F1BC063E03937E0A536EE6FB7D563BE2EFE77170A0280860FB9B36B05E3`.
+
+The board's first post-flash status was idle, ADC/IMU healthy, SD unavailable.
+Five UART start retries each completed card initialization, then returned
+`FR_NO_FILESYSTEM` (13); each was refused with `#ERR:SD_REQUIRED` and `#STOP`.
+The selected mode remained All after refusal. Repeated failures did not worsen:
+the last two retry checks both reported 122,732 free bytes, 118,264 minimum, and
+59,392 largest block. No recording files were opened. The UART logs are in
+`benchmarks/robustness-2026-09-28/sd-retry-01.jsonl`, `sd-retry-02.jsonl`, and
+`sd-retry-03.jsonl` (ignored local bench artifacts).
+
+The card advertises 31,457,280 sectors of 512 bytes (15 GiB). Its MBR has one
+FAT32-LBA partition (type `0x0C`) at LBA 2048 with 31,453,184 sectors, which
+fits the reported card. The partition boot sector was read identically twice
+and reports 512-byte sectors, 16 sectors per cluster, two FATs, 2,082 reserved
+sectors, and **132,116,480 total sectors**—about 63 GiB, over four times both
+the partition and reported card capacity. This is direct evidence of
+inconsistent FAT32 volume geometry, not of a transient sector-read failure.
+The card identity, CSD capacity, and FAT metadata still need comparison against
+what Windows reports; this does not by itself prove which component is wrong.
+No storage recording or UDP acceptance run was attempted after the firmware
+correctly refused the unavailable SD.
+
+Next, compare the reported size/volume geometry with Windows without writing
+to the card, then use a backed-up, known-good MBR/FAT32 card whose volume size
+matches its reported capacity. Preserve this card unchanged until its contents
+are backed up. Once mount succeeds, run the saved-file SD check first; only
+then proceed to 60-second SD-only and SD+UDP captures. A small follow-up
+firmware improvement is to distinguish `MOUNT` from `INIT` in `#SDSTATE` and
+`#SD:FAIL`: the current status says `FAILED,INIT` although the observed failure
+is precisely mount result 13. No analog-signal quality or physical LED
+visibility conclusion is possible with open sensor inputs and no camera view.

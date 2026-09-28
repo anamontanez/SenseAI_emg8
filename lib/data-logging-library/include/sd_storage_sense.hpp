@@ -168,6 +168,12 @@ public:
      */
     esp_err_t deinit(void);
 
+    // Read-only sector access used only by the mount-failure diagnostic.
+    // The caller must provide a DMA-capable buffer at least one sector large.
+    esp_err_t readSector(uint32_t sector, void* buffer);
+    uint32_t getSectorSize(void) const;
+    uint32_t getSectorCount(void) const;
+
     /**
      * @brief Mount the SD card filesystem
      *

@@ -151,6 +151,27 @@ def firmware_diagnostics(lines):
                 diagnostics_complete=not (missing or malformed) if present else None)
 
 
+def recording_stop_kind(started, stop_requested, recording_started):
+    if not started:
+        return None
+    if stop_requested:
+        return 'ack'
+    return 'unexpected' if recording_started else 'refused'
+
+
+def stop_drain_complete(stop_ack, counter_count, summary_count,
+                        summary_start, require_sd):
+    return stop_ack and counter_count == 4 and (
+        not require_sd or summary_count > summary_start)
+
+
+def validate_sd_summary(summary, require_sd):
+    if require_sd and summary is None:
+        raise TimeoutError('Missing SD final summary')
+    if summary and summary.get('result') != 'OK':
+        raise RuntimeError('SD recording is incomplete: ' + repr(summary))
+
+
 def run(args):
     import serial
     output = Path(args.output)
@@ -172,6 +193,9 @@ def run(args):
     status = None
     start_time = None
     stop_time = None
+    stop_requested = False
+    stop_ack = False
+    sd_summaries = []
     counters = {}
     last_sub = 0.0
     last_status_query = 0.0
@@ -185,7 +209,7 @@ def run(args):
         serial_file.flush()
 
     def poll():
-        nonlocal status, start_time, last_sub, last_status_query
+        nonlocal status, start_time, stop_ack, last_sub, last_status_query
         if started and args.status_interval > 0 and time.perf_counter() - last_status_query >= args.status_interval:
             send("?")
             last_status_query = time.perf_counter()
@@ -203,9 +227,29 @@ def run(args):
                 status = [int(v) for v in line.split(':', 1)[1].split(',')]
             if line == '#REC':
                 start_time = now
+            if line.startswith('#SDSUM:'):
+                fields = line.split(':', 1)[1].split(',')
+                if len(fields) == 6:
+                    try:
+                        sd_summaries.append(dict(file_set=fields[0], raw=int(fields[1]),
+                            env=int(fields[2]), imu=int(fields[3]), bytes=int(fields[4]),
+                            result=fields[5]))
+                    except ValueError:
+                        raise RuntimeError('Malformed SD summary: ' + line)
+                else:
+                    raise RuntimeError('Malformed SD summary: ' + line)
             if line.startswith('#CNT:'):
                 values = [int(v) for v in line.split(':', 1)[1].split(',')]
                 counters[values[0] - 1] = values[1:]
+            if line == '#STOP':
+                stop_kind = recording_stop_kind(
+                    started, stop_requested, start_time is not None)
+                if stop_kind == 'refused':
+                    raise RuntimeError('Device refused recording before #REC')
+                if stop_kind == 'unexpected':
+                    raise RuntimeError('Device stopped recording before host stop command')
+                if stop_kind == 'ack':
+                    stop_ack = True
             if 'Guru Meditation' in line or line.startswith('#BOOT:'):
                 raise RuntimeError('Unexpected device reset: ' + line)
         if sock:
@@ -283,11 +327,23 @@ def run(args):
             send('U1')
             wait(.15)
         stop_time = time.perf_counter()
+        summary_start = len(sd_summaries)
+        stop_requested = True
         send('0')
-        wait(1.0)  # collect CNT plus all 30ms partial UDP batches
-        started = False
+        close_deadline = time.perf_counter() + 30.0
+        while time.perf_counter() < close_deadline:
+            if stop_drain_complete(stop_ack, len(counters), len(sd_summaries),
+                                   summary_start, args.require_sd):
+                break
+            wait(.05)
+        if not stop_ack:
+            raise TimeoutError('Missing bounded recording stop acknowledgement')
         if len(counters) != 4:
             raise RuntimeError('Missing per-ADC stop counters')
+        sd_summary = sd_summaries[-1] if len(sd_summaries) > summary_start else None
+        validate_sd_summary(sd_summary, args.require_sd)
+        wait(.2)  # drain trailing UDP datagrams after the final writer close
+        started = False
         if args.condition in ('udp', 'quiet') and not records.packets:
             raise RuntimeError('No received UDP data')
     except Exception as exc:
@@ -316,7 +372,8 @@ def run(args):
         failure = failure or 'Incomplete or malformed firmware diagnostics; see serial.jsonl'
     elapsed = stop_time - start_time if stop_time is not None and start_time is not None else None
     result.update(condition=args.condition, mode=args.mode, rate=args.rate, host_window_s=elapsed,
-                  failure=failure, final_status=status, counts=counters)
+                  failure=failure, final_status=status, counts=counters,
+                  sd_summary=(sd_summaries[-1] if sd_summaries else None))
     result['host_timed_acquired_hz'] = {
         f'{adc}:{ch}': round(values[ch] / elapsed, 3)
         for adc, values in sorted(counters.items()) for ch in range(4)

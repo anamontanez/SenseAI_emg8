@@ -223,6 +223,23 @@ FRESULT SD::unmountCard(void) {
     return err;
 }
 
+esp_err_t SD::readSector(uint32_t sector, void* buffer) {
+    if (!deviceRegistered_ || buffer == nullptr) return ESP_ERR_INVALID_STATE;
+    if (sector >= static_cast<uint32_t>(sdCardInfo_.csd.capacity))
+        return ESP_ERR_INVALID_ARG;
+    return sdmmc_read_sectors(&sdCardInfo_, buffer, sector, 1);
+}
+
+uint32_t SD::getSectorSize(void) const {
+    return sdCardInfo_.csd.sector_size > 0 ?
+        static_cast<uint32_t>(sdCardInfo_.csd.sector_size) : 0;
+}
+
+uint32_t SD::getSectorCount(void) const {
+    return sdCardInfo_.csd.capacity > 0 ?
+        static_cast<uint32_t>(sdCardInfo_.csd.capacity) : 0;
+}
+
 const char* SD::getFastFsErrName(FRESULT err) {
     if (err > -1 && err < 20) {
         return fatFsErr[err];

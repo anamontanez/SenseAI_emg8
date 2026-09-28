@@ -10,7 +10,7 @@ class MountCleanup(unittest.TestCase):
     def test_failed_mount_retry_releases_every_registration(self):
         root = Path(__file__).resolve().parents[1]
         src = (root / 'lib/data-logging-library/src/sd_storage_sense.cpp').read_text(encoding='utf-8')
-        body = src[src.index('esp_err_t SD::deinit(void) {'):src.index('const char* SD::getFastFsErrName')]
+        body = src[src.index('esp_err_t SD::deinit(void) {'):src.index('esp_err_t SD::readSector')]
         body = body.replace('esp_err_t SD::', 'constexpr esp_err_t ').replace('FRESULT SD::', 'constexpr FRESULT ')
         harness = r'''
 using BYTE=unsigned char; using esp_err_t=int;

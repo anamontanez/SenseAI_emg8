@@ -718,6 +718,100 @@ static void sdCloseFiles() {
     filesOpen = false;
 }
 
+// Read only a few filesystem-identification sectors when mount fails. This
+// never exposes user files or writes to the card; two reads per LBA also show
+// whether the SPI path returned stable bytes. It runs only while stopped.
+static void diagnoseSdMount() {
+    if (!sdCard) return;
+    const uint32_t sectorSize = sdCard->getSectorSize();
+    const uint32_t sectorCount = sdCard->getSectorCount();
+    printf("#SDDIAG:CARD,%lu,%lu\n", (unsigned long)sectorSize,
+           (unsigned long)sectorCount);
+    if (sectorSize != 512 || sectorCount == 0) {
+        printf("#SDDIAG:SKIP,SECTOR_GEOMETRY\n");
+        return;
+    }
+
+    auto* reads = static_cast<uint8_t*>(heap_caps_malloc(
+        2 * sectorSize, MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+    if (!reads) {
+        printf("#SDDIAG:SKIP,NO_DMA_MEMORY\n");
+        return;
+    }
+    uint8_t* first = reads;
+    uint8_t* second = reads + sectorSize;
+    auto readAndReport = [&](uint32_t lba) {
+        const esp_err_t a = sdCard->readSector(lba, first);
+        const esp_err_t b = a == ESP_OK ? sdCard->readSector(lba, second) : a;
+        const bool same = a == ESP_OK && b == ESP_OK &&
+                          memcmp(first, second, sectorSize) == 0;
+        const bool signature = a == ESP_OK && first[510] == 0x55 && first[511] == 0xaa;
+        const bool exfat = a == ESP_OK && memcmp(first + 3, "EXFAT   ", 8) == 0;
+        const bool fat32 = a == ESP_OK && memcmp(first + 82, "FAT32   ", 8) == 0;
+        const bool gpt = a == ESP_OK && memcmp(first, "EFI PART", 8) == 0;
+        const char* kind = gpt ? "GPT" : exfat ? "EXFAT" : fat32 ? "FAT32" :
+            signature ? "MBR_OR_FAT" : "UNKNOWN";
+        const uint16_t bytesPerSector = a == ESP_OK ?
+            uint16_t(first[11] | (uint16_t(first[12]) << 8)) : 0;
+        const uint8_t sectorsPerCluster = a == ESP_OK ? first[13] : 0;
+        const uint16_t reserved = a == ESP_OK ?
+            uint16_t(first[14] | (uint16_t(first[15]) << 8)) : 0;
+        const uint8_t fatCount = a == ESP_OK ? first[16] : 0;
+        const uint32_t totalSectors = a == ESP_OK ?
+            (uint16_t(first[19] | (uint16_t(first[20]) << 8)) ?
+             uint16_t(first[19] | (uint16_t(first[20]) << 8)) :
+             uint32_t(first[32]) | (uint32_t(first[33]) << 8) |
+             (uint32_t(first[34]) << 16) | (uint32_t(first[35]) << 24)) : 0;
+        const uint32_t fatSectors = a == ESP_OK ?
+            (uint16_t(first[22] | (uint16_t(first[23]) << 8)) ?
+             uint16_t(first[22] | (uint16_t(first[23]) << 8)) :
+             uint32_t(first[36]) | (uint32_t(first[37]) << 8) |
+             (uint32_t(first[38]) << 16) | (uint32_t(first[39]) << 24)) : 0;
+        printf("#SDSECTOR:%lu,%d,%d,%u,%u,%s,%u,%u,%u,%u,%lu,%lu\n",
+               (unsigned long)lba, (int)a, (int)b, same ? 1u : 0u,
+               signature ? 1u : 0u, kind, (unsigned)bytesPerSector,
+               (unsigned)sectorsPerCluster, (unsigned)reserved,
+               (unsigned)fatCount, (unsigned long)totalSectors,
+               (unsigned long)fatSectors);
+        return same && signature;
+    };
+
+    const bool mbrReadable = readAndReport(0);
+    bool inspectGptHeader = false;
+    const bool sectorZeroLooksLikeBoot = mbrReadable &&
+        (first[0] == 0xeb || first[0] == 0xe9 || first[0] == 0xe8) &&
+        uint16_t(first[11] | (uint16_t(first[12]) << 8)) == sectorSize;
+    if (mbrReadable && !sectorZeroLooksLikeBoot) {
+        struct Partition { uint8_t type; uint32_t start; uint32_t length; };
+        Partition partitions[4]{};
+        for (unsigned i = 0; i < 4; ++i) {
+            const uint8_t* entry = first + 446 + i * 16;
+            partitions[i].type = entry[4];
+            partitions[i].start = uint32_t(entry[8]) |
+                (uint32_t(entry[9]) << 8) | (uint32_t(entry[10]) << 16) |
+                (uint32_t(entry[11]) << 24);
+            partitions[i].length = uint32_t(entry[12]) |
+                (uint32_t(entry[13]) << 8) | (uint32_t(entry[14]) << 16) |
+                (uint32_t(entry[15]) << 24);
+        }
+        for (unsigned i = 0; i < 4; ++i) {
+            const Partition part = partitions[i];
+            if (part.type == 0) continue;
+            printf("#SDPART:%u,%02X,%lu,%lu\n", i + 1, (unsigned)part.type,
+                   (unsigned long)part.start, (unsigned long)part.length);
+            if (part.type == 0xee) inspectGptHeader = true;
+            if (part.start > 0 && part.start < sectorCount &&
+                part.length <= sectorCount - part.start)
+                readAndReport(part.start);
+            else if (part.start > 0)
+                printf("#SDPART:OUT_OF_RANGE,%u\n", i + 1);
+        }
+    }
+    if (inspectGptHeader && sectorCount > 1) readAndReport(1);
+    heap_caps_free(reads);
+    printf("#SDDIAG:END\n");
+}
+
 // Called at boot, then only by the SD owner while acquisition is stopped.
 // A single reinitialization attempt; SDK command timeouts may exceed 500 ms.
 // No formatting, deletion, root fallback, or reuse of an existing directory.
@@ -741,6 +835,7 @@ static bool sdRecover() {
     FRESULT fr = sdCard->mountCard();
     if (fr != FR_OK) {
         printf("#ERR:SD_MOUNT:%d\n", (int)fr);
+        diagnoseSdMount();
         return false;
     }
     const std::string root = sdCard->getCurrentDir();
@@ -1053,6 +1148,56 @@ struct AdcBusControl {
 };
 static AdcBusControl adcControl[2];
 
+struct AdcConfigPlan {
+    ADS1015::ChannelConfig configs[2][2][4]{};
+    uint8_t counts[2][2]{};
+};
+
+static constexpr bool addAdcChannel(AdcConfigPlan& plan, uint8_t adc,
+                                    uint8_t channel, uint8_t divider) {
+    if (adc >= 4) return false;
+    uint8_t bus = adc / 2;
+    uint8_t index = adc % 2;
+    uint8_t& count = plan.counts[bus][index];
+    if (count >= 4) return false;
+    plan.configs[bus][index][count++] = {
+        channel, divider, ADS1015::ConfigPGA::One};
+    return true;
+}
+
+static constexpr bool buildAdcConfigPlan(Mode selectedMode,
+                                         uint8_t selectedSensor,
+                                         AdcConfigPlan& plan) {
+    for (auto& bus : plan.counts)
+        bus[0] = bus[1] = 0;
+    if (selectedMode == Mode::Sensor) {
+        uint8_t sensor = selectedSensor % kNUM_SENSORS;
+        uint8_t adc = sensorAdc(sensor);
+        if (!addAdcChannel(plan, adc, sensorChannel(sensor), 1))
+            return false;
+    } else if (selectedMode == Mode::All || selectedMode == Mode::Raw ||
+               selectedMode == Mode::Env) {
+        bool raw = selectedMode == Mode::All || selectedMode == Mode::Raw;
+        bool env = selectedMode == Mode::All || selectedMode == Mode::Env;
+        for (uint8_t adc = 0; adc < 4; ++adc) {
+            if (raw &&
+                (!addAdcChannel(plan, adc, kRawCh[adc][0], 1) ||
+                 !addAdcChannel(plan, adc, kRawCh[adc][1], 1)))
+                return false;
+            uint8_t divider = raw ? kSLOW_DIV : 1;
+            if (env &&
+                (!addAdcChannel(plan, adc, kEnvCh[adc][0], divider) ||
+                 !addAdcChannel(plan, adc, kEnvCh[adc][1], divider)))
+                return false;
+        }
+    } else {
+        return false;
+    }
+
+    return plan.counts[0][0] || plan.counts[0][1] ||
+           plan.counts[1][0] || plan.counts[1][1];
+}
+
 // Only main submits commands. The completion semaphore transfers ownership of
 // each configuration/result between main and the worker, without hot-path locks.
 static esp_err_t commandAdcWorkers(uint8_t command) {
@@ -1064,6 +1209,24 @@ static esp_err_t commandAdcWorkers(uint8_t command) {
         if (adcControl[bus].result != ESP_OK) result = adcControl[bus].result;
     }
     return result;
+}
+
+static bool configureAdcsForMode() {
+    AdcConfigPlan plan{};
+    if (!buildAdcConfigPlan(mode, testSensor, plan)) {
+        printf("#ERR:ADC_CONFIG,MODE=%u\n", (unsigned)mode);
+        return false;
+    }
+
+    for (int bus = 0; bus < 2; ++bus) {
+        adcControl[bus].counts[0] = plan.counts[bus][0];
+        adcControl[bus].counts[1] = plan.counts[bus][1];
+        for (int adc = 0; adc < 2; ++adc)
+            for (int channel = 0; channel < plan.counts[bus][adc]; ++channel)
+                adcControl[bus].configs[adc][channel] =
+                    plan.configs[bus][adc][channel];
+    }
+    return true;
 }
 
 static void adcRateWake(void* arg) {
@@ -1250,33 +1413,7 @@ static bool countdown(int seconds) {
 
 static bool startADCs() {
     for (auto& control : adcControl) control.rateLimited = limitFastRate1000;
-    for (auto& control : adcControl)
-        for (auto& count : control.counts) count = 0;
-
-    if (mode == Mode::Sensor) {
-        uint8_t sensor = testSensor % kNUM_SENSORS;
-        uint8_t a = sensorAdc(sensor);
-        auto& control = adcControl[a / 2];
-        control.configs[a % 2][0] = {sensorChannel(sensor), 1, ADS1015::ConfigPGA::One};
-        control.counts[a % 2] = 1;
-    } else {
-        bool raw = mode == Mode::All || mode == Mode::Raw;
-        bool env = mode == Mode::All || mode == Mode::Env;
-        for (int a = 0; a < 4; ++a) {
-            auto& control = adcControl[a / 2];
-            auto* cfg = control.configs[a % 2];
-            uint8_t& n = control.counts[a % 2];
-            if (raw) {
-                cfg[n++] = {kRawCh[a][0], 1, ADS1015::ConfigPGA::One};
-                cfg[n++] = {kRawCh[a][1], 1, ADS1015::ConfigPGA::One};
-            }
-            if (env) {
-                uint8_t div = raw ? kSLOW_DIV : 1;
-                cfg[n++] = {kEnvCh[a][0], div, ADS1015::ConfigPGA::One};
-                cfg[n++] = {kEnvCh[a][1], div, ADS1015::ConfigPGA::One};
-            }
-        }
-    }
+    if (!configureAdcsForMode()) return false;
     esp_err_t err = commandAdcWorkers(kAdcStart);
     if (err == ESP_OK) return true;
     commandAdcWorkers(kAdcStop);
@@ -1346,6 +1483,19 @@ static void handleSensorCommand() {
 //  countdown was aborted ('0' arrived during the wait).
 // ─────────────────────────────────────────────
 static bool startRecording() {
+    if (mode < Mode::All || mode > Mode::Sensor) {
+        printf("#ERR:MODE\n#STOP\n");
+        updateStatusLed();
+        return false;
+    }
+    // Validate the intended channels before making a session directory,
+    // starting the auxiliary, or acknowledging #REC. startADCs() rebuilds
+    // this configuration after the countdown (sensor selection may change).
+    if (!configureAdcsForMode()) {
+        printf("#STOP\n");
+        updateStatusLed();
+        return false;
+    }
     printf("#MODE:%d\n", (int)mode);
     // Announce which sensor is live so the host doesn't have to infer it
     // from the CSV header (the selection persists across mode changes).
@@ -1397,8 +1547,16 @@ static bool startRecording() {
     saveMetadata(3, currentPhase, curGrasp, curRep, 0);
     saveMetadata(4, currentPhase, 0, 0, 0);
     if (!startADCs()) {
+        if (recording) {
+            recording = false;
+            stopCompanion(true);
+            waitImuIdle();
+            commandSdWriter(SdCommand::Close);
+            printf("#STOP\n");
+        }
         sdRecordingStarted = false;
         printSdSummary();
+        updateStatusLed();
         return false;
     }
     updateStatusLed();
@@ -2179,7 +2337,7 @@ extern "C" void app_main() {
 
     // A command/reed/button selects the mode in the wait loop. Only then do
     // all start paths share the same storage preflight and ADC checks.
-    if (mode != Mode::Idle && !startRecording()) mode = Mode::Idle;
+    if (mode != Mode::Idle) startRecording();
 
     /* ==== Main loop: monitor reed + UART ================================== */
     constexpr uint32_t kDebounceMs = 300;
@@ -2213,6 +2371,7 @@ extern "C" void app_main() {
                 stopRecordingCore();
                 printf("#PAUSE\n");
             } else {
+                if (mode == Mode::Idle) mode = Mode::All;
                 startRecording();
             }
         }

@@ -9,6 +9,11 @@ import unittest
 class RecordingSafety(unittest.TestCase):
     def test_start_and_runtime_faults(self):
         src = (Path(__file__).resolve().parents[1] / "src/main.cpp").read_text(encoding="utf-8")
+        self.assertIn("if (mode != Mode::Idle) startRecording();", src)
+        reed_start = src.index("// ---- Reed switch toggle")
+        reed_end = src.index("// ---- Physical backup/OR button", reed_start)
+        reed = src[reed_start:reed_end]
+        self.assertIn("if (mode == Mode::Idle) mode = Mode::All;", reed)
         start = src[src.index("static bool startRecording() {"):src.index("// ─", src.index("static bool startRecording() {"))]
         safety = src[src.index("static void serviceRecordingSafety() {"):src.index("// ─", src.index("static void serviceRecordingSafety() {"))]
         # Local-static cache is per simulated board instead of per executable.
@@ -25,7 +30,7 @@ template<class T> struct Flag {
  constexpr void store(T v,int=0) { value=v; }
  constexpr Flag& operator=(T v) { value=v; return *this; }
 };
-enum class Mode { Idle, All, Sensor };
+enum class Mode { Idle, All, Raw, Env, Sensor };
 enum class SdCommand { Open, Close };
 enum class SdFault { None, Init, Open, Write, Sync, Close, Overflow, Metadata };
 enum class SessionPhase { Demo };
@@ -45,6 +50,7 @@ struct Board {
  Text sdFileSet;
  bool openOK=true, countdownOK=true, linkOK=true, adcStartOK=true, boundaryOK=true;
  int opens=0, closes=0, countdowns=0, starts=0, recAcks=0, stopAcks=0;
+ int companionStops=0;
  int stops=0, summaries=0, metadata=0, wrapEvents=0;
  uint64_t elapsed=0, streamStart=0;
  constexpr void printf(const char* fmt, ...) {
@@ -54,6 +60,7 @@ struct Board {
  constexpr void printSensorLine() {}
  constexpr void updateStatusLed() {}
  constexpr void resetDropCounters() {}
+ constexpr bool configureAdcsForMode() { return mode != Mode::Idle; }
  constexpr const char* sdFaultName(SdFault) { return "FAIL"; }
  constexpr bool commandSdWriter(SdCommand c) {
   if(c==SdCommand::Close) { ++closes; return true; }
@@ -66,6 +73,7 @@ struct Board {
  constexpr uint64_t esp_timer_get_time() { return 100; }
  constexpr uint64_t recordingElapsedUs() { return elapsed; }
  constexpr bool sendStartToSlave() { return linkOK; }
+ constexpr void stopCompanion(bool) { ++companionStops; }
  constexpr bool startADCs() { ++starts; return adcStartOK; }
  constexpr bool saveMetadata(unsigned kind,SessionPhase,unsigned,unsigned,uint32_t) {
   ++metadata; if(kind==4) ++wrapEvents; return true;
@@ -76,9 +84,11 @@ struct Board {
         checks = r'''
 };
 constexpr int run() {
- Board b; b.openOK=false;
+ Board b; b.mode=Mode::Idle;
+ CHECK(!b.startRecording() && b.opens==0 && b.starts==0 && b.recAcks==0);
+ b=Board{}; b.openOK=false;
  CHECK(!b.startRecording() && !b.recording && b.opens==1 && b.countdowns==0);
- CHECK(b.recAcks==0 && b.starts==0);
+ CHECK(b.recAcks==0 && b.starts==0 && b.mode==Mode::All);
  b=Board{}; b.adcOK=false;
  CHECK(!b.startRecording() && b.opens==0 && b.starts==0 && b.recAcks==0);
  b=Board{}; b.countdownOK=false;
@@ -87,6 +97,9 @@ constexpr int run() {
  CHECK(!b.startRecording() && !b.recording && b.closes==1 && b.starts==0);
  b=Board{}; b.boundaryOK=false;
  CHECK(!b.startRecording() && !b.recording && b.closes==1 && b.starts==0);
+ b=Board{}; b.adcStartOK=false;
+ CHECK(!b.startRecording() && !b.recording && b.closes==1 &&
+       b.companionStops==1 && b.stopAcks==1 && b.recAcks==0);
  b=Board{};
  CHECK(b.startRecording() && b.recording && b.recAcks==1 && b.starts==1);
  CHECK(b.metadata==2 && b.wrapEvents==1);

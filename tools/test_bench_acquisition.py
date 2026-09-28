@@ -1,7 +1,17 @@
 import struct
+import contextlib
+import io
+import json
+from pathlib import Path
+import tempfile
+import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from bench_acquisition import HEADER, SAMPLE, Records, firmware_diagnostics
+from bench_acquisition import (HEADER, SAMPLE, Records, firmware_diagnostics,
+                               recording_stop_kind, stop_drain_complete,
+                               validate_sd_summary, run)
 
 
 def packet(seq, records, kind=0):
@@ -101,6 +111,102 @@ class DecoderTests(unittest.TestCase):
         for ts in range(1000, 20002000, 1000):
             r.timestamps['0:0:0'].append(ts)
         self.assertEqual(r.summary()['channels']['0:0:0']['complete_10s_received_hz'], [1000])
+
+
+class StopDrainTests(unittest.TestCase):
+    def test_refusal_unexpected_stop_and_drain_gates(self):
+        self.assertEqual(recording_stop_kind(False, False, False), None)
+        self.assertEqual(recording_stop_kind(True, False, False), 'refused')
+        self.assertEqual(recording_stop_kind(True, False, True), 'unexpected')
+        self.assertEqual(recording_stop_kind(True, True, True), 'ack')
+        self.assertFalse(stop_drain_complete(False, 4, 2, 1, True))
+        self.assertFalse(stop_drain_complete(True, 3, 2, 1, True))
+        self.assertFalse(stop_drain_complete(True, 4, 1, 1, True))
+        self.assertTrue(stop_drain_complete(True, 4, 2, 1, True))
+        self.assertTrue(stop_drain_complete(True, 4, 1, 1, False))
+
+    def test_missing_and_incomplete_saved_summary_fail(self):
+        with self.assertRaisesRegex(TimeoutError, 'Missing SD final summary'):
+            validate_sd_summary(None, True)
+        with self.assertRaisesRegex(RuntimeError, 'incomplete'):
+            validate_sd_summary({'result': 'INCOMPLETE'}, True)
+        validate_sd_summary({'result': 'OK'}, True)
+
+    def test_stop_waits_for_close_delayed_over_one_second(self):
+        class FakeSerial:
+            instance = None
+
+            def __init__(self, **_kwargs):
+                type(self).instance = self
+                self.port = None
+                self.dtr = self.rts = False
+                self.timeout = 0
+                self.is_open = False
+                self.rx = bytearray()
+                self.stop_requested_at = None
+                self.close_delay = None
+                self.final_lines_queued = False
+
+            def open(self):
+                self.is_open = True
+
+            def close(self):
+                self.is_open = False
+
+            def write(self, data):
+                command = data.decode('ascii')
+                if command == '?':
+                    self.rx.extend(b'#STATUS:1,0,1,1,0,0,0,0,0\n')
+                elif command == 'R1000\n':
+                    self.rx.extend(b'#RATE:1000\n')
+                elif command == '1':
+                    self.rx.extend(b'#REC\n')
+                elif command == '0' and self.stop_requested_at is None:
+                    self.stop_requested_at = time.monotonic()
+                return len(data)
+
+            def _release_close(self):
+                if (self.stop_requested_at is not None and
+                        not self.final_lines_queued and
+                        time.monotonic() - self.stop_requested_at >= 1.1):
+                    self.close_delay = time.monotonic() - self.stop_requested_at
+                    rows = [
+                        '#SDSUM:s_TEST_0/000.bin,16,16,2,328,OK',
+                        '#CNT:1,2,2,2,2,0,0',
+                        '#CNT:2,2,2,2,2,0,0',
+                        '#CNT:3,2,2,2,2,0,0',
+                        '#CNT:4,2,2,2,2,0,0',
+                        '#STOP',
+                    ]
+                    self.rx.extend(('\n'.join(rows) + '\n').encode('ascii'))
+                    self.final_lines_queued = True
+
+            @property
+            def in_waiting(self):
+                self._release_close()
+                return len(self.rx)
+
+            def read(self, size=1):
+                self._release_close()
+                if not self.rx:
+                    return b''
+                result = self.rx[:size]
+                del self.rx[:size]
+                return bytes(result)
+
+        with tempfile.TemporaryDirectory() as folder:
+            args = SimpleNamespace(port='COM5', host='192.168.4.1', condition='off',
+                mode=1, rate='1000', require_sd=True, status_interval=0,
+                seconds=0.05, connect_wait=0, wifi_profile=None,
+                output=str(Path(folder) / 'capture'))
+            fake_module = SimpleNamespace(Serial=FakeSerial)
+            with patch.dict('sys.modules', {'serial': fake_module}), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(run(args), 0)
+            self.assertGreaterEqual(FakeSerial.instance.close_delay, 1.0)
+            result = json.loads((Path(args.output) / 'summary.json').read_text())
+            self.assertIsNone(result['failure'])
+            self.assertEqual(result['sd_summary']['result'], 'OK')
+            self.assertEqual(len(result['counts']), 4)
 
 
 if __name__ == '__main__':
