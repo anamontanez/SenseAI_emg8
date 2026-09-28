@@ -158,6 +158,9 @@ def verify(folder, files, capture):
     assert actual_bytes == saved['bytes'], ('Firmware #SDSUM byte count', saved['bytes'], actual_bytes)
     file_dir, file_number = saved['file_set'].rsplit('/', 1)
     expected_master = file_dir + '/M' + file_number
+    # #SDSUM uses FatFs paths (for example, "0:/session/000.bin"), while
+    # the F directory listing omits the volume prefix ("session/M000.bin").
+    expected_master = expected_master.split(':', 1)[-1].lstrip('/')
     assert expected_master in files, ('Firmware #SDSUM file set', expected_master, files)
     if summary.get('rate') == '1000':
         for (adc, ch), count in counts.items():

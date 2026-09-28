@@ -1895,3 +1895,17 @@ refused the saved bracelet Wi-Fi reconnect with `WlanQueryInterface` error 5
 remained idle with SD ready. No UDP delivery result was obtained. Retry only
 after the host can join the saved `EMG8-24EC4A368770` profile; the isolated
 failure is on the laptop's Wi-Fi control path, not an SD or firmware result.
+
+Then ran the existing SD read-back harness in no-network mode for 5 seconds.
+It downloaded `M002.bin`, `R002.bin`, `E002.bin`, and `I002.bin` over UART and
+verified their decoded records against `#CNT` and `#SDSUM`, monotonic sample
+timestamps, recording metadata, exact byte totals, and unchanged earlier
+files. It reported 40,094 raw, 2,000 envelope, and 985 IMU records (356,520
+bytes), with host-timed rates of 1,001.3–1,002.7 Hz raw and 49.986 Hz envelope;
+ADC I2C errors, retriggers, and storage drops were zero. This condition had
+UDP disabled, so the verifier's all-records-absent-from-UDP count is expected.
+The verifier initially rejected the FatFs `0:` volume prefix in `#SDSUM` when
+matching the unprefixed `F` listing. Fixed that host-side path normalization
+and added a regression test; all 14 `test_bench_sd.py` tests pass, and the
+already-downloaded files now verify successfully. Capture:
+`benchmarks/robustness-2026-09-28/sd-readback-smoke/`.

@@ -52,6 +52,11 @@ class SavedRecords(unittest.TestCase):
         self.assertEqual(result['sd_records'], [16, 16, 2])
         self.assertEqual(result['sd_absent_from_udp'], [0, 0, 0])
 
+    def test_fatfs_volume_prefix_matches_unprefixed_listing(self):
+        self.summary['sd_summary']['file_set'] = '0:/s_TEST_0/000.bin'
+        self.write_summary()
+        self.assertTrue(self.check()['sd_bytes_match'])
+
     def test_phase_metadata_extension_and_corruption(self):
         path = self.sd / 'M000.bin'
         header = bytearray(path.read_bytes())

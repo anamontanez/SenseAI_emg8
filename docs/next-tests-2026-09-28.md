@@ -327,11 +327,15 @@ cap completed with an `OK` close summary, zero ADC I2C errors/retriggers/queue
 drops, and file sizes matching all reported record counts. Details and captures
 are in `WORKLOG.md` and `benchmarks/robustness-2026-09-28/`.
 
-The firmware-side directory listing verified file names and lengths; the binary
-files have not yet been retrieved and decoded on the host. The next test should
-combine SD and UDP, then compare saved records to received packets. That harness
-was attempted but Windows denied reconnecting to the saved bracelet Wi-Fi
-profile with `WlanQueryInterface` error 5 (elevation required), so it stopped
-before starting a recording. No UDP result is available yet. The ADC inputs
-were open throughout these tests, so no electrode signal-quality claim is
-possible.
+The firmware-side directory listing verified file names and lengths. The
+binary files were then downloaded and decoded on the host by the SD read-back
+harness; counts, monotonic timestamps, metadata, and byte totals match. The
+harness had a small `0:` FatFs volume-prefix mismatch when matching the
+firmware summary to the directory listing; that normalization is fixed and its
+14 focused tests pass. The read-back was an SD-only run, so it does not test
+UDP delivery. The next test should combine SD and UDP, then compare saved
+records to received packets. That harness was attempted but Windows denied
+reconnecting to the saved bracelet Wi-Fi profile with `WlanQueryInterface`
+error 5 (elevation required), so it stopped before starting a recording. No
+UDP result is available yet. The ADC inputs were open throughout these tests,
+so no electrode signal-quality claim is possible.
