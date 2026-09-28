@@ -1825,3 +1825,16 @@ UART confirmation is in `benchmarks/robustness-2026-09-28/sd-mount-label.jsonl`.
 Next check: compare the card's reported physical capacity and Windows volume
 size without writing; collect more card identity/geometry evidence before
 deciding on a backed-up reformat or replacement.
+
+A read-only register probe now rereads CID and CSD after the mount failure,
+printing card identity and fresh CSD capacity beside the initialized sector
+count. All 41 host checks pass, the storage image built and was uploaded to
+COM5, and a status query still reports idle `FAILED,MOUNT`. No recording
+command was sent and no SD file was opened. The uploaded image uses 72,996
+bytes static RAM and 949,014 bytes flash (BIN SHA256
+`B18BBB2FF2FC033CF0A5B93862B14C080C5EDF6274F1CA6F3A9C84CBE8FB2AC2`). The
+status-only capture is
+`benchmarks/robustness-2026-09-28/sd-status-after-csd-flash.jsonl`; its startup
+register lines require one operator power cycle because the upload reset
+preceded the serial capture. After that, compare the CSD identity/capacity with
+Windows' physical-device and volume sizes before deciding on any repair.

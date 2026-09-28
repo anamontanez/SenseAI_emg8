@@ -11,6 +11,7 @@
 #define __SD_SENSE_INTERNAL__
 
 #include "sd_storage_sense.hpp"
+#include "esp_private/sdmmc_common.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -238,6 +239,22 @@ uint32_t SD::getSectorSize(void) const {
 uint32_t SD::getSectorCount(void) const {
     return sdCardInfo_.csd.capacity > 0 ?
         static_cast<uint32_t>(sdCardInfo_.csd.capacity) : 0;
+}
+
+esp_err_t SD::readCardRegisters(sdmmc_cid_t* cid, sdmmc_csd_t* csd) {
+    if (!deviceRegistered_ || cid == nullptr || csd == nullptr)
+        return ESP_ERR_INVALID_ARG;
+
+    sdmmc_cid_t freshCid{};
+    sdmmc_csd_t freshCsd{};
+    esp_err_t err = sdmmc_send_cmd_send_cid(&sdCardInfo_, &freshCid);
+    if (err != ESP_OK) return err;
+    err = sdmmc_send_cmd_send_csd(&sdCardInfo_, &freshCsd);
+    if (err != ESP_OK) return err;
+
+    *cid = freshCid;
+    *csd = freshCsd;
+    return ESP_OK;
 }
 
 const char* SD::getFastFsErrName(FRESULT err) {

@@ -173,6 +173,9 @@ public:
     esp_err_t readSector(uint32_t sector, void* buffer);
     uint32_t getSectorSize(void) const;
     uint32_t getSectorCount(void) const;
+    // Re-read the card's identification and capacity registers. Used only by
+    // the stopped-state mount diagnostic; this does not access filesystem data.
+    esp_err_t readCardRegisters(sdmmc_cid_t* cid, sdmmc_csd_t* csd);
 
     /**
      * @brief Mount the SD card filesystem

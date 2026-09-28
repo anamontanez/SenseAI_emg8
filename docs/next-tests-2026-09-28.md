@@ -276,3 +276,19 @@ Once mounting succeeds, run the saved-file SD check first; only then proceed
 to 60-second SD-only and SD+UDP captures. No analog-signal quality or physical
 LED visibility conclusion is possible with open sensor inputs and no camera
 view.
+
+## Follow-up read-only register probe
+
+Added a stopped-state CMD10/CMD9 reread through ESP-IDF's decoded CID/CSD
+helpers. On mount failure, the diagnostic reports manufacturer/product ID and
+serial plus the initialization-time and freshly decoded capacity values; it
+still reads only identification registers and filesystem-identifying sectors.
+Build and upload succeeded on COM5, with 72,996 bytes static RAM and 949,014
+bytes flash (BIN SHA256
+`B18BBB2FF2FC033CF0A5B93862B14C080C5EDF6274F1CA6F3A9C84CBE8FB2AC2`, ELF
+SHA256 `1DB0FF833832E0813F6C5D89184577DACF51C0513A7AA6CE429F4252B9891771`).
+A UART `?` query after upload confirms idle mode and `FAILED,MOUNT`; its capture
+is `benchmarks/robustness-2026-09-28/sd-status-after-csd-flash.jsonl`. That
+query did not reset the board, so it does not contain startup `#SDREG` lines.
+Capture those on the next operator power cycle, then compare the reported
+15 GiB CSD capacity with Windows before any card repair.

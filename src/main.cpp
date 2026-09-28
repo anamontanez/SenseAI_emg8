@@ -728,6 +728,24 @@ static void diagnoseSdMount() {
     const uint32_t sectorCount = sdCard->getSectorCount();
     printf("#SDDIAG:CARD,%lu,%lu\n", (unsigned long)sectorSize,
            (unsigned long)sectorCount);
+    sdmmc_cid_t cid{};
+    sdmmc_csd_t csd{};
+    const esp_err_t registers = sdCard->readCardRegisters(&cid, &csd);
+    printf("#SDREG:CID,%d,%d,%d,%.*s,%d,%08lX,%d\n", (int)registers,
+           registers == ESP_OK ? cid.mfg_id : 0,
+           registers == ESP_OK ? cid.oem_id : 0,
+           registers == ESP_OK ? 8 : 0,
+           registers == ESP_OK ? cid.name : "",
+           registers == ESP_OK ? cid.revision : 0,
+           (unsigned long)(registers == ESP_OK ? (uint32_t)cid.serial : 0),
+           registers == ESP_OK ? cid.date : 0);
+    printf("#SDREG:CSD,%d,%lu,%d,%d,%d,%d,%d\n", (int)registers,
+           (unsigned long)sectorCount,
+           registers == ESP_OK ? csd.capacity : 0,
+           registers == ESP_OK ? csd.sector_size : 0,
+           registers == ESP_OK ? csd.csd_ver : 0,
+           registers == ESP_OK ? csd.read_block_len : 0,
+           registers == ESP_OK ? csd.tr_speed : 0);
     if (sectorSize != 512 || sectorCount == 0) {
         printf("#SDDIAG:SKIP,SECTOR_GEOMETRY\n");
         return;
