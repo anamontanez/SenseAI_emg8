@@ -1843,3 +1843,13 @@ different card size. Captures are `sd-register-ondemand.jsonl` and
 `sd-status-after-diagnostic.jsonl` under the robustness benchmark directory.
 Compare Windows' physical-device and volume sizes before considering repair or
 formatting.
+
+The operator confirms the physical card is 16 GiB. Read-only laptop checks see
+removable drive `E:` as not ready, and `fsutil fsinfo volumeinfo E:` returns
+Error 1005: “The volume does not contain a recognized file system.” This
+independently reproduces the filesystem failure on Windows. The earlier CMD59
+initialization problem had been fixed; the September 7 worklog records a
+successful mount and read of `test.txt` on this card. Today's `FR_NO_FILESYSTEM`
+is a later, distinct FAT geometry issue. No repair, reformat, or SD write was
+attempted; establish whether any card contents need recovery before considering
+repair.

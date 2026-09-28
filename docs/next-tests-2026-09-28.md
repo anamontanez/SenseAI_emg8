@@ -304,7 +304,15 @@ cause of mount failure. It localizes the current `FR_NO_FILESYSTEM` failure to
 the volume geometry exposed to FatFs. A following status query still reports
 idle mode and `FAILED,MOUNT`; its capture is
 `benchmarks/robustness-2026-09-28/sd-status-after-diagnostic.jsonl`. The result
-does not establish why Windows created or sees that geometry, so compare
-Windows' physical-card and volume sizes without writing or formatting before
-any repair. The `D` command avoids startup-capture timing issues on later
-checks.
+does not establish how the FAT geometry became inconsistent. The `D` command
+avoids startup-capture timing issues on later checks.
+
+The operator confirmed the physical card is 16 GiB. On the connected laptop,
+Windows exposes it as removable drive `E:` but .NET reports the volume is not
+ready; read-only `fsutil fsinfo volumeinfo E:` returns Error 1005, “The volume
+does not contain a recognized file system.” This independently confirms that
+the present filesystem is not mountable by Windows either. The older CMD59
+initialization failure was fixed earlier; WORKLOG records this card mounting
+and `test.txt` being read successfully afterward. The current failure is a
+separate, later FAT-volume geometry problem. No repair, format, or SD write was
+performed. Before any repair, decide whether files on the card need recovery.
