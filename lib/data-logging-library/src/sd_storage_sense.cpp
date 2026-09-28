@@ -109,6 +109,8 @@ static esp_err_t sdInitTransaction(int slot, sdmmc_command_t* cmd) {
 }
 
 esp_err_t SD::init(void) {
+    // Recovery reuses this object; do not leak a device slot after failed init.
+    deinit();
     sdspi_device_config_t sdConfig = SDSPI_DEVICE_CONFIG_DEFAULT();
     sdConfig = {
         .host_id = spiHandle_.getHost(),
@@ -124,6 +126,7 @@ esp_err_t SD::init(void) {
     if (err) {
         return err;
     }
+    deviceRegistered_ = true;
 
     sdHost_ = {
         .flags = SDMMC_HOST_FLAG_SPI | SDMMC_HOST_FLAG_DEINIT_ARG,
@@ -157,23 +160,22 @@ esp_err_t SD::init(void) {
     // The compatibility wrapper is initialization-only, with no runtime cost.
     sdHost_.do_transaction = &sdspi_host_do_transaction;
     sdCardInfo_.host.do_transaction = &sdspi_host_do_transaction;
+    if (err != ESP_OK) deinit();
     return err;
 }
 
 esp_err_t SD::deinit(void) {
-    if (pFatFs_ != nullptr) {
-        unmountCard();
-    }
-
     if (pFile_ != nullptr) {
         f_close(pFile_);
         delete pFile_;
         pFile_ = nullptr;
     }
+    if (pFatFs_ != nullptr || driveRegistered_) unmountCard();
 
     esp_err_t err = ESP_OK;
-    if (sdHost_.deinit_p) {
+    if (deviceRegistered_) {
         err = sdHost_.deinit_p(sdHost_.slot);
+        deviceRegistered_ = false;
     }
 
     path_.clear();
@@ -183,11 +185,14 @@ esp_err_t SD::deinit(void) {
 }
 
 FRESULT SD::mountCard(void) {
-    pFatFs_ = new FATFS;
+    if (!deviceRegistered_) return FR_NOT_READY;
+    if (pFatFs_) return FR_OK;
 
     // To prepare FatFs driver
-    ff_diskio_get_drive(&driveNum_);
+    if (ff_diskio_get_drive(&driveNum_) != ESP_OK) return FR_NOT_ENOUGH_CORE;
+    pFatFs_ = new FATFS{};
     ff_diskio_register_sdmmc(driveNum_, &sdCardInfo_);
+    driveRegistered_ = true;
     ff_sdmmc_set_disk_status_check(driveNum_, true);
 
     root_[0] = (char)('0' + driveNum_);
@@ -196,6 +201,7 @@ FRESULT SD::mountCard(void) {
 
     FRESULT err = f_mount(pFatFs_, root_, (BYTE)MountMode::kMountNow);
     if (err != FR_OK) {
+        unmountCard();
         return err;
     }
 
@@ -205,7 +211,11 @@ FRESULT SD::mountCard(void) {
 }
 
 FRESULT SD::unmountCard(void) {
-    FRESULT err = f_mount(nullptr, root_, 0);
+    FRESULT err = pFatFs_ ? f_mount(nullptr, root_, 0) : FR_OK;
+    if (driveRegistered_) {
+        ff_diskio_unregister(driveNum_);
+        driveRegistered_ = false;
+    }
     delete pFatFs_;
     pFatFs_ = nullptr;
     path_.clear();

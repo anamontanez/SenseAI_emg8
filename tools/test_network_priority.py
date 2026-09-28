@@ -46,6 +46,7 @@ struct Harness {
     static constexpr uint32_t kRawFlushMs=30, kLowRateFlushMs=100;
     constexpr long long esp_timer_get_time() { return 60000000; }
     constexpr void pollSubscribe() { ++polls; }
+    constexpr void applyRecordingBoundary() {}
     constexpr void observeNetwork(NetStoragePressure) {}
     constexpr bool hostUartQuiet() { return quiet; }
     constexpr void hostSetUartQuiet(bool next) { quiet=next; }

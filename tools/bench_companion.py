@@ -71,8 +71,8 @@ def run(args):
             card.download(name, size, target)
             data = target.read_bytes()
             if target.name.startswith('M'):
-                assert data[26]==1 and (len(data)-32)%12==0
-                metadata = list(struct.iter_unpack('<IHHI', data[32:]))
+                assert data[26] in (1, 2) and (len(data)-32)%12==0
+                metadata = [r for r in struct.iter_unpack('<IHHI', data[32:]) if r[3] >> 8 != 4]
             if target.name[0] in 'RE':
                 for ts,adc,ch,value in struct.iter_unpack('<IBBh',data):
                     disk_counts[adc,ch]+=1

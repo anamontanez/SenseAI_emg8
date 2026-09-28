@@ -41,12 +41,16 @@ void netStreamStop();
 /** @brief True between netStreamStart() and netStreamStop(). */
 bool netStreamActive();
 
+// Called with acquisition stopped. Discards any previous recording's backlog
+// without cycling the AP, and arms a first-successful-data-send notification.
+bool netBeginRecording();
+uint64_t netTakeStreamStart();
+
 /**
- * @brief Mute ordinary device output on UART0 for UDP operation.
+ * @brief Mute preview data and driver logs on UART0 for UDP operation.
  *
- * Receive stays enabled on purpose. Complete auxiliary lines still use UART0
- * at a low rate while recording, so no new UDP packet type is needed. `U1`
- * has to work blind, so muting ordinary output must never cost us the way back in.
+ * Receive, command/status/fault lines, and complete auxiliary lines remain
+ * available. U0 must never conceal a failed recording from the operator.
  */
 void hostSetUartQuiet(bool quiet);
 bool hostUartQuiet(void);

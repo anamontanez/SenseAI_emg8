@@ -15,6 +15,7 @@ import time
 
 import serial
 from bench_acquisition import RAW, ENV
+from sd_clock import master_events, unwrap_sample
 
 
 class Card:
@@ -110,13 +111,14 @@ def verify(folder, files, capture):
                 assert data[25] == (1 if summary['rate'] == '1000' else 0), 'Wrong rate metadata'
             events = list(struct.iter_unpack('<IHHI', data[32:]))
             extension = data[26]
-            assert extension in (0, 1), 'Unknown metadata extension'
+            assert extension in (0, 1, 2), 'Unknown metadata extension'
             label_count = len(events)
-            if extension == 1:
+            if extension in (1, 2):
                 assert events and events[0][0] == 0 and events[0][3] >> 8 == 3, 'Missing initial metadata'
-                assert all(word & 255 in (4, 5, 6) and word >> 8 in (1, 2, 3)
-                           for _, _, _, word in events), 'Invalid phase/event metadata'
-                assert all(a[0] <= b[0] for a, b in zip(events, events[1:])), 'Metadata time reversed'
+                try:
+                    list(master_events(data))
+                except ValueError as exc:
+                    raise AssertionError(str(exc)) from exc
                 label_count = sum(word >> 8 == 1 for _, _, _, word in events)
             masters.append({'file': name, 'mode': data[24], 'rate_code': data[25],
                             'metadata_extension': extension, 'event_count': len(events),
@@ -135,6 +137,10 @@ def verify(folder, files, capture):
                 counts[key] += 1
             else:
                 key = ('imu',)
+            try:
+                ts = unwrap_sample(ts, last.get(key))
+            except ValueError as exc:
+                raise AssertionError(str(exc)) from exc
             assert key not in last or ts > last[key], (name, key, ts, last.get(key))
             first.setdefault(key, ts)
             last[key] = ts

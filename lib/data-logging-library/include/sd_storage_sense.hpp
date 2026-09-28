@@ -373,21 +373,23 @@ public:
     FRESULT inFileGoTo(uint32_t byteToGo);
 
 private:
-    sdspi_dev_handle_t sdHandler_;  ///< SD card SPI device handle
+    sdspi_dev_handle_t sdHandler_{};  ///< SD card SPI device handle
+    bool deviceRegistered_ = false;
     SPI& spiHandle_;                ///< Reference to SPI interface object
     gpio_num_t csPin_;              ///< Chip Select GPIO pin
     gpio_num_t cdPin_;              ///< Card Detect GPIO pin (optional)
     gpio_num_t wpPin_;              ///< Write Protect GPIO pin (optional)
     gpio_num_t intPin_;             ///< Interrupt GPIO pin (optional)
 
-    sdmmc_host_t sdHost_;      ///< SD/MMC host configuration
-    sdmmc_card_t sdCardInfo_;  ///< SD card information structure
+    sdmmc_host_t sdHost_{};      ///< SD/MMC host configuration
+    sdmmc_card_t sdCardInfo_{};  ///< SD card information structure
 
     std::string path_ = "";  ///< Current working path on SD card
 
     FATFS* pFatFs_ = nullptr;  ///< Pointer to FatFs filesystem object
     uint8_t driveNum_ = 0;     ///< Drive number for FatFs
-    char root_[3];             ///< Root directory string
+    bool driveRegistered_ = false;
+    char root_[3]{};             ///< Root directory string
 
     uint16_t maxChunkSize_ = 4095;  ///< Maximum chunk size for read/write operations
 

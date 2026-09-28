@@ -1,6 +1,7 @@
 #include "companion_rx.hpp"
 #include "companion_rx_buffer.hpp"
 #include "net_stream.hpp"
+#include "recording_clock.hpp"
 #include <cstdio>
 #include "driver/uart.h"
 #include "esp_timer.h"
@@ -33,7 +34,7 @@ void companionReceive() {
         int count = uart_read_bytes(UART_NUM_1, bytes, sizeof(bytes), 0);
         if (count <= 0) break;
         for (int i = 0; i < count; ++i) {
-            switch (buffer.feed(bytes[i])) {
+            switch (buffer.feed(bytes[i], bytes[i] == '\n' ? recordingElapsedUs() : 0)) {
             case CompanionRxBuffer::Result::Accepted: ++received; break;
             case CompanionRxBuffer::Result::Rejected: ++rejected; break;
             case CompanionRxBuffer::Result::Full: ++dropped; break;
@@ -57,21 +58,16 @@ void companionForward(bool live) {
     const uint32_t limit = buffer.snapshot(); // new arrivals wait for next batch
     CompanionRxBuffer::View view{};
     while (buffer.peek(limit, view)) {
-        if (live && !hostUartQuiet()) {
+        if (live) {
             // One stdio call holds its stream lock for the entire line, even
             // when the ring wraps. No raw UART writes mixed with other prints.
-            int count = printf("%.*s%.*s\n", int(view.firstSize), view.first,
+            // Additive timestamp sideband keeps existing exact-match monitor
+            // parsers working. One stdio lock pairs it with the original line.
+            int count = printf("#AUXTS:%llu\n%.*s%.*s\n",
+                               (unsigned long long)view.timestamp,
+                               int(view.firstSize), view.first,
                                int(view.secondSize), view.second);
-            if (count == int(view.firstSize + view.secondSize + 1)) ++forwarded;
-            else ++dropped;
-        } else if (live) {
-            // hostPrintf suppresses normal output in U0, so write only the
-            // complete auxiliary line directly at the low relay rate.
-            int count = uart_write_bytes(UART_NUM_0, view.first, view.firstSize);
-            count += uart_write_bytes(UART_NUM_0, view.second, view.secondSize);
-            static const uint8_t lf = '\n';
-            count += uart_write_bytes(UART_NUM_0, &lf, 1);
-            if (count == int(view.firstSize + view.secondSize + 1)) ++forwarded;
+            if (count > int(view.firstSize + view.secondSize + 1)) ++forwarded;
             else ++dropped;
         } else ++muted;
         buffer.consume(view);

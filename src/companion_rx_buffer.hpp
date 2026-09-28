@@ -10,17 +10,21 @@ public:
     static constexpr uint32_t maxLine = 3078; // Ana's 3072-byte payload + imp:[]
     enum class Result { None, Accepted, Rejected, Full };
     struct View { const char* first; uint32_t firstSize; const char* second;
-                  uint32_t secondSize; uint32_t end; };
+                  uint32_t secondSize; uint32_t end; uint64_t timestamp; };
 
-    Result feed(uint8_t byte) {
+    Result feed(uint8_t byte, uint64_t timestamp = 0) {
         if (byte == '\n') {
             if (dropping_) { resetPartial(); return Result::None; }
             // Accept CRLF as well as LF, forwarding canonical LF.
             if (used_ && at(used_ - 1) == '\r') --used_;
             if (!valid()) { resetPartial(); return Result::Rejected; }
             if (!room()) { resetPartial(); return Result::Full; }
-            bytes_[(begin_ + used_) % capacity] = '\n';
-            begin_ = (begin_ + used_ + 1) % capacity;
+            // Publish the receipt stamp with the line in the same ring. A
+            // timestamp may contain LF bytes, so peek skips this fixed header.
+            for (uint32_t i = 0; i < 8; ++i)
+                bytes_[(begin_ + i) % capacity] = static_cast<char>(timestamp >> (i * 8));
+            bytes_[(begin_ + 8 + used_) % capacity] = '\n';
+            begin_ = (begin_ + 8 + used_ + 1) % capacity;
             published_.store(begin_, std::memory_order_release);
             used_ = 0;
             return Result::Accepted;
@@ -30,7 +34,7 @@ public:
             losePartial(); return Result::Rejected;
         }
         if (!room()) { losePartial(); return Result::Full; }
-        bytes_[(begin_ + used_++) % capacity] = static_cast<char>(byte);
+        bytes_[(begin_ + 8 + used_++) % capacity] = static_cast<char>(byte);
         return Result::None;
     }
 
@@ -43,11 +47,15 @@ public:
     bool peek(uint32_t limit, View& view) const {
         uint32_t start = consumed_.load(std::memory_order_relaxed), end = start;
         if (start == limit) return false;
+        uint64_t timestamp = 0;
+        for (uint32_t i = 0; i < 8; ++i)
+            timestamp |= uint64_t(static_cast<uint8_t>(bytes_[(start + i) % capacity])) << (i * 8);
+        start = end = (start + 8) % capacity;
         while (end != limit && bytes_[end] != '\n') end = (end + 1) % capacity;
         if (end == limit) return false;
         uint32_t size = (end + capacity - start) % capacity;
         uint32_t first = size < capacity - start ? size : capacity - start;
-        view = {bytes_ + start, first, bytes_, size - first, (end + 1) % capacity};
+        view = {bytes_ + start, first, bytes_, size - first, (end + 1) % capacity, timestamp};
         return true;
     }
     void consume(const View& view) {
@@ -59,9 +67,10 @@ private:
     std::atomic<uint32_t> published_{0}, consumed_{0};
     uint32_t begin_ = 0, used_ = 0;
     bool dropping_ = false;
-    char at(uint32_t index) const { return bytes_[(begin_ + index) % capacity]; }
+    char at(uint32_t index) const { return bytes_[(begin_ + 8 + index) % capacity]; }
     bool room() const {
-        return (begin_ + used_ + 1) % capacity != consumed_.load(std::memory_order_acquire);
+        const uint32_t free = (consumed_.load(std::memory_order_acquire) + capacity - begin_ - 1) % capacity;
+        return 8 + used_ < free;
     }
     void resetPartial() { used_ = 0; dropping_ = false; }
     bool matches(uint32_t pos, const char* text) const {

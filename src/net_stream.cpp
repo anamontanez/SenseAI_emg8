@@ -5,6 +5,7 @@
  ******************************************************************************/
 #include "net_stream.hpp"
 #include "pause_timing.hpp"
+#include "recording_clock.hpp"
 
 #include <atomic>
 #include <cstring>
@@ -36,6 +37,14 @@ constexpr uint8_t  kApChannel = 6;
 #define EMG8_WIFI_TX_POWER_QDBM 40
 #endif
 
+// Keep the validated association setting until a physical noise/link A/B test.
+// The optional quiet-beacon environment selects 1000 TU (1.024 seconds).
+#ifndef EMG8_WIFI_BEACON_TU
+#define EMG8_WIFI_BEACON_TU 100
+#endif
+static_assert(EMG8_WIFI_BEACON_TU >= 100 && EMG8_WIFI_BEACON_TU <= 60000,
+              "SoftAP beacon interval must be 100..60000 TU");
+
 constexpr uint8_t kTypeRaw = 0;
 constexpr uint8_t kTypeEnv = 1;
 constexpr uint8_t kTypeImu = 2;
@@ -58,6 +67,9 @@ bool taskCreated  = false;
 TaskHandle_t netTaskHandle = nullptr;
 SemaphoreHandle_t stopped = nullptr;
 std::atomic<bool> stopRequested{false};
+std::atomic<bool> beginRequested{false};
+std::atomic<uint64_t> streamStartedAt{0};
+bool streamArmed = false; // net task owns while active
 
 QueueHandle_t rawQ = nullptr;
 QueueHandle_t envQ = nullptr;
@@ -136,6 +148,24 @@ struct Batch {
 };
 Batch batches[3];
 
+void applyRecordingBoundary() {
+    if (!beginRequested.load(std::memory_order_acquire)) return;
+    for (auto& b : batches) b.count = 0;
+    if (rawQ) xQueueReset(rawQ);
+    if (envQ) xQueueReset(envQ);
+    if (imuQ) xQueueReset(imuQ);
+    streamStartedAt = 0;
+    streamArmed = true;
+    beginRequested.store(false, std::memory_order_release);
+}
+
+void noteFirstPacket(uint8_t type) {
+    if (streamArmed && (type == kTypeRaw || type == kTypeEnv)) {
+        streamArmed = false;
+        streamStartedAt.store(recordingElapsedUs(), std::memory_order_release);
+    }
+}
+
 void writeHeader(Batch& b, uint8_t type) {
     b.buf[0] = 'E';
     b.buf[1] = '8';
@@ -165,6 +195,7 @@ bool sendBatch(Batch& b, uint8_t type, size_t recSize) {
             return false;
         } else {
             txPackets.fetch_add(1, std::memory_order_relaxed);
+            noteFirstPacket(type);
         }
     }
     // Sequence advances even without a client so a late subscriber sees
@@ -235,6 +266,7 @@ void pollSubscribe() {
 
 void netTask(void*) {
     while (true) {
+        applyRecordingBoundary();
         if (!active.load(std::memory_order_acquire) || sock < 0) {
             // Only acknowledge after the previous poll/pump iteration ended.
             // The control task may then close/reset the socket and batches.
@@ -306,6 +338,7 @@ esp_err_t wifiInitOnce(const char* macStr) {
     apCfg.ap.channel = kApChannel;
     apCfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
     apCfg.ap.max_connection = 2;
+    apCfg.ap.beacon_interval = EMG8_WIFI_BEACON_TU;
 
     err = esp_wifi_set_mode(WIFI_MODE_AP);
     if (err != ESP_OK) return err;
@@ -440,6 +473,26 @@ void netStreamStop() {
 
 bool netStreamActive() {
     return active.load(std::memory_order_acquire);
+}
+
+bool netBeginRecording() {
+    beginRequested.store(true, std::memory_order_release);
+    if (!active.load(std::memory_order_acquire)) {
+        // A dormant task may wake periodically, so let it own the reset if it
+        // exists; otherwise there are no queues/sender to race with.
+        if (!taskCreated) applyRecordingBoundary();
+    }
+    if (taskCreated) xTaskNotifyGive(netTaskHandle);
+    const int64_t deadline = esp_timer_get_time() + 1000000;
+    while (beginRequested.load(std::memory_order_acquire)) {
+        if (esp_timer_get_time() >= deadline) return false;
+        vTaskDelay(1);
+    }
+    return true;
+}
+
+uint64_t netTakeStreamStart() {
+    return streamStartedAt.exchange(0, std::memory_order_acq_rel);
 }
 
 void netEnqueueRaw(const Sample& s) {

@@ -8,6 +8,7 @@ class CompanionReceive(unittest.TestCase):
         source=re.sub(r"    (Result|void|uint32_t|bool|char) (\w+)\(", r"    constexpr \1 \2(", source)
         prelude="""
 using uint8_t=unsigned char; using uint32_t=unsigned;
+using uint64_t=unsigned long long;
 namespace std {
 enum memory_order { memory_order_relaxed, memory_order_acquire, memory_order_release };
 template<class T> struct atomic {
@@ -40,7 +41,7 @@ constexpr int check() {
  CHECK(!b.peek(limit,v));
  CHECK(b.peek(b.snapshot(),v) && equal(v,"p1:1,p2:2,temp:30")); b.consume(v);
  for(int i=0;i<300;++i) {
-  CHECK(line(b,"p1:1,p2:2,temp:3\n")==R::Accepted);
+ CHECK(line(b,"p1:1,p2:2,temp:3\n")==R::Accepted);
   CHECK(b.peek(b.snapshot(),v) && equal(v,"p1:1,p2:2,temp:3")); b.consume(v);
  }
  line(b,"imp:[");
@@ -63,8 +64,21 @@ constexpr int check() {
  CHECK(b.peek(b.snapshot(),v) && equal(v,"imp:[12,34]")); b.consume(v);
  CHECK(!b.peek(b.snapshot(),v)); return 0;
 }
+constexpr int stamped() {
+ B b; B::View v{};
+ // Stamp publication, including ring wrap and LF bytes inside binary stamp.
+ for (uint64_t i=0; i<400; ++i) {
+  CHECK(line(b,"p1:1,p2:2,temp:3")==R::None);
+  const uint64_t stamp=(0x0aULL<<40) + 0xffffffffULL + i;
+  CHECK(b.feed('\n',stamp)==R::Accepted);
+  CHECK(b.peek(b.snapshot(),v) && v.timestamp==stamp);
+  CHECK(equal(v,"p1:1,p2:2,temp:3")); b.consume(v);
+ }
+ return 0;
+}
 constexpr int result=check();
 static_assert(result==0,"RX failure: result identifies CHECK line");
+static_assert(stamped()==0,"Receipt timestamp lost or damaged across ring/time wrap");
 """
         compiler=shutil.which("clang++")
         self.assertIsNotNone(compiler)

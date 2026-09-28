@@ -166,6 +166,7 @@ static constexpr uint16_t kIMU_ODR_HZ = 200;      // IMU polling rate
 #include "companion_link.hpp"
 #include "companion_rx.hpp"
 #include "emg8_types.hpp"   // Sample / ImuSample / LabelEvent (shared with net_stream)
+#include "recording_clock.hpp"
 #include <cstdarg>
 #include "net_stream.hpp"
 
@@ -179,7 +180,8 @@ static constexpr uint16_t kIMU_ODR_HZ = 200;      // IMU polling rate
  */
 static int hostPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static int hostPrintf(const char* fmt, ...) {
-    if (hostUartQuiet()) return 0;
+    // U0 suppresses previews, never faults, acknowledgements or save results.
+    if (hostUartQuiet() && fmt[0] != '#') return 0;
     va_list ap;
     va_start(ap, fmt);
     int n = vprintf(fmt, ap);
@@ -241,8 +243,11 @@ static volatile Mode mode      = Mode::Idle;
 static std::atomic<bool> recording{false};
 static std::atomic<int64_t> recStart{0};     // µs epoch for timestamps
 static std::atomic<bool> sdOK{false};           // Shared with the SD writer
-enum class SdFault : uint8_t { None, Init, Open, Write, Sync, Close };
+enum class SdFault : uint8_t { None, Init, Open, Write, Sync, Close, Overflow, Metadata };
 static std::atomic<SdFault> sdFault{SdFault::None};
+static std::atomic<uint32_t> metadataDrops{0}, imuSamples{0}, imuReadErrors{0};
+static uint32_t reportedWrap = 0;
+static bool starting = false;
 static bool uartHostSeen = false;                // UART0 has received a command since boot.
 
 // Separate queues for each stream → separate files
@@ -274,9 +279,28 @@ static uint32_t recordingTimestampUs() {
     return (uint32_t)(esp_timer_get_time() - recStart.load(std::memory_order_relaxed));
 }
 
-static void sendStartToSlave() {
-    if (!companionStart(recStart.load(std::memory_order_relaxed), currentPhase))
-        printf("#ERR:LINK_QUEUE\n");
+uint64_t recordingElapsedUs() {
+    const int64_t epoch = recStart.load(std::memory_order_relaxed);
+    return epoch ? static_cast<uint64_t>(esp_timer_get_time() - epoch) : 0;
+}
+
+static const char* sdFaultName(SdFault fault) {
+    switch (fault) {
+    case SdFault::Init: return "INIT";
+    case SdFault::Open: return "OPEN";
+    case SdFault::Write: return "WRITE";
+    case SdFault::Sync: return "SYNC";
+    case SdFault::Close: return "CLOSE";
+    case SdFault::Overflow: return "QUEUE_OVERFLOW";
+    case SdFault::Metadata: return "METADATA";
+    default: return "NONE";
+    }
+}
+
+static bool sendStartToSlave() {
+    if (companionStart(recStart.load(std::memory_order_relaxed), currentPhase)) return true;
+    printf("#ERR:LINK_QUEUE\n");
+    return false;
 }
 
 static void stopCompanion(bool notify) {
@@ -294,6 +318,7 @@ static bool saveMetadata(uint8_t kind, SessionPhase phase, uint16_t grasp,
     event.repetition = repetition;
     event._reserved = static_cast<uint8_t>(phase) | (uint32_t(kind) << 8);
     if (labelQ && xQueueSend(labelQ, &event, 0) == pdTRUE) return true;
+    ++metadataDrops;
     printf("#ERR:METADATA_QUEUE\n");
     return false;
 }
@@ -318,6 +343,9 @@ static void resetDropCounters() {
     rawDrops.store(0, std::memory_order_relaxed);
     envDrops.store(0, std::memory_order_relaxed);
     imuDrops.store(0, std::memory_order_relaxed);
+    metadataDrops = 0;
+    imuSamples = 0;
+    imuReadErrors = 0;
 }
 
 static const char* resetReasonName(esp_reset_reason_t reason) {
@@ -354,17 +382,17 @@ static void updateStatusLed() {
     uint8_t red = 0, green = 0, blue = 0;
     bool on = true;
     const SdFault fault = sdFault.load(std::memory_order_relaxed);
-    if (!adcOK) {
-        red = 32; blue = 24; // ADC fault: purple
-    } else if (fault == SdFault::Init || (!sdOK && fault == SdFault::None)) {
-        red = 24; // SD unavailable at boot: steady dim red
-    } else if (fault != SdFault::None || !sdOK) {
-        red = 48;
-        // Open fault: slow red flash. Write/sync/close fault: fast red flash.
-        on = fault == SdFault::Open ? (nowMs / 600) % 2 == 0
-                                    : (nowMs / 150) % 2 == 0;
+    if (fault != SdFault::None || !sdOK) {
+        // Fault visibility wins over animation, connection, and countdown.
+        red = 255;
+        on = (nowMs / 250) % 2 == 0;
+    } else if (!adcOK) {
+        red = 160; blue = 128; // ADC fault: bright purple
     } else if (recording.load(std::memory_order_relaxed)) {
         green = 32;
+    } else if (starting) {
+        red = 48; green = 20;
+        on = (nowMs / 500) % 2 == 0;
     } else if (netStreamActive()) {
         blue = 32; // Wi-Fi AP active
     } else if (uartHostSeen) {
@@ -399,7 +427,7 @@ static void printBuildConfig() {
            i2c, (int)kRDY[0], (int)kRDY[1], (int)kRDY[2], (int)kRDY[3]);
 }
 
-static void printStatusLine() {
+static void printCompactStatus() {
     uint16_t mv = 0;
     uint8_t pct = 0;
     if (battery) {
@@ -418,6 +446,19 @@ static void printStatusLine() {
            (unsigned long)rawDrops.load(std::memory_order_relaxed),
            (unsigned long)envDrops.load(std::memory_order_relaxed),
            (unsigned long)imuDrops.load(std::memory_order_relaxed));
+    printf("#SDSTATE:%s,%s\n", sdOK && sdFault.load() == SdFault::None ?
+           (recording ? "WRITING" : "READY") : "FAILED",
+           sdFaultName(sdFault.load()));
+    const uint64_t duration = recordingElapsedUs();
+    printf("#IMURATE:TARGET=%u,COUNT=%lu,ERRORS=%lu,MILLIHZ=%llu\n",
+           kIMU_ODR_HZ, (unsigned long)imuSamples.load(),
+           (unsigned long)imuReadErrors.load(),
+           (unsigned long long)(recording && duration ?
+               uint64_t(imuSamples.load()) * 1000000000ULL / duration : 0));
+}
+
+static void printStatusLine() {
+    printCompactStatus();
     printBuildConfig();
     printf("#PHASE:%s\n", phaseName(currentPhase));
     companionPrintStats();
@@ -514,7 +555,13 @@ static void onSample(uint8_t ch, int16_t val, uint32_t tsUs, void* arg) {
 
 static FIL filMaster, filRaw, filEnv, filImu;
 static bool filesOpen = false;
-static uint16_t recIndex = 0;   // per-recording file set index within the session
+static uint32_t recIndex = 0;   // consume an index even after a partial open
+static std::string sdFileSet;
+static uint32_t sdRawRecords = 0, sdEnvRecords = 0, sdImuRecords = 0;
+static uint64_t sdBytes = 0;
+static bool sdSummaryPending = false; // ownership transferred with command acknowledgement
+static bool sdRecordingStarted = false;
+static bool sdCommandResult = false;
 
 enum class SdCommand : uint8_t { Open, Close };
 static QueueHandle_t sdCommands = nullptr;
@@ -523,10 +570,31 @@ static SemaphoreHandle_t imuRunMutex = nullptr;
 
 // Only main submits commands; acknowledgement transfers file ownership.
 // ADC and IMU producers are stopped before Close is submitted.
-static void commandSdWriter(SdCommand command) {
-    if (!sdCommands) return;
+static bool commandSdWriter(SdCommand command) {
+    if (!sdCommands) return false;
     xQueueSend(sdCommands, &command, portMAX_DELAY);
-    xSemaphoreTake(sdCommandDone, portMAX_DELAY);
+    // Retain ownership until the writer finishes, but keep faults visible
+    // during card timeouts. Never cancel/delete a task inside FatFs.
+    while (xSemaphoreTake(sdCommandDone, pdMS_TO_TICKS(20)) != pdTRUE)
+        updateStatusLed();
+    return sdCommandResult;
+}
+
+static void printSdSummary() {
+    if (!sdSummaryPending) return;
+    sdSummaryPending = false;
+    const bool complete = sdRecordingStarted && sdOK && sdFault.load() == SdFault::None &&
+        rawDrops.load() == 0 && envDrops.load() == 0 && imuDrops.load() == 0 &&
+        metadataDrops.load() == 0;
+    if (sdFault.load() != SdFault::None)
+        printf("#SD:FAIL,%s,%llu\n", sdFaultName(sdFault.load()),
+               (unsigned long long)recordingElapsedUs());
+    // Counts are successful full writes, not proof of persistence on an error.
+    // Only OK follows successful final sync/close of all four files.
+    printf("#SDSUM:%s,%lu,%lu,%lu,%llu,%s\n", sdFileSet.c_str(),
+           (unsigned long)sdRawRecords, (unsigned long)sdEnvRecords,
+           (unsigned long)sdImuRecords, (unsigned long long)sdBytes,
+           complete ? "OK" : "INCOMPLETE");
 }
 
 static void waitImuIdle() {
@@ -574,7 +642,12 @@ static bool sdOpenFiles(const std::string& base) {
     // One file set per recording start (R000.bin, R001.bin, ...) so a
     // pause/resume or stop/start never truncates earlier data.
     char suffix[16];
-    snprintf(suffix, sizeof(suffix), "%03u.bin", (unsigned)recIndex);
+    snprintf(suffix, sizeof(suffix), "%03u.bin", (unsigned)recIndex++);
+    sdFileSet = base + "/" + suffix;
+    sdSummaryPending = true;
+    sdRecordingStarted = false;
+    sdRawRecords = sdEnvRecords = sdImuRecords = 0;
+    sdBytes = 0;
     std::string mPath = base + "/M" + suffix;
     std::string rPath = base + "/R" + suffix;
     std::string ePath = base + "/E" + suffix;
@@ -595,7 +668,6 @@ static bool sdOpenFiles(const std::string& base) {
         sdFault.store(SdFault::Open, std::memory_order_relaxed);
         return false;
     }
-    recIndex++;
 
     // Write master header (32 bytes, v4)
     // [0-3] "EMG8"  [4] ver=4  [5] nADC  [6] nCh  [7] div
@@ -623,7 +695,8 @@ static bool sdOpenFiles(const std::string& base) {
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     memcpy(hdr + 18, mac, 6);
     hdr[24] = (uint8_t)mode;
-    hdr[26] = 1;  // metadata extension: phase/event kind in LabelEvent::_reserved
+    hdr[26] = 2;  // metadata extension 2: kinds 1..3 plus explicit wrap anchors
+    hdr[27] = 1;  // wrap anchors: metadata kind 4 carries the high timestamp word
     hdr[25] = recordingRate1000.load(std::memory_order_relaxed) ? 1 : 0;  // v4 reserved byte: 0=max, 1=1000 Hz cap
 
     filesOpen = true;
@@ -632,6 +705,7 @@ static bool sdOpenFiles(const std::string& base) {
         sdCloseFiles();
         return false;
     }
+    sdBytes = sizeof(hdr);
     return true;
 }
 
@@ -642,6 +716,68 @@ static void sdCloseFiles() {
     sdCloseChecked(&filImu, "I");
     sdCloseChecked(&filMaster, "M");
     filesOpen = false;
+}
+
+// Called at boot, then only by the SD owner while acquisition is stopped.
+// A single reinitialization attempt; SDK command timeouts may exceed 500 ms.
+// No formatting, deletion, root fallback, or reuse of an existing directory.
+static bool sdRecover() {
+    sdOK = false;
+#ifndef EMG8_NO_SD
+    static bool spiReady = false;
+    if (!spiSD)
+        spiSD = new SPI(SPI::SpiMode::kMaster, SPI2_HOST, kSD_MOSI, kSD_MISO, kSD_SCK);
+    if (!spiReady) {
+        esp_err_t err = spiSD->init();
+        if (err != ESP_OK) return false;
+        spiReady = true;
+    }
+    if (!sdCard) sdCard = new SD(*spiSD, kSD_CS);
+    esp_err_t err = sdCard->init(); // releases any old disk/device registration
+    if (err != ESP_OK) {
+        printf("#ERR:SD_INIT:%s\n", esp_err_to_name(err));
+        return false;
+    }
+    FRESULT fr = sdCard->mountCard();
+    if (fr != FR_OK) {
+        printf("#ERR:SD_MOUNT:%d\n", (int)fr);
+        return false;
+    }
+    const std::string root = sdCard->getCurrentDir();
+    const long long epoch = esp_timer_get_time() / 1000000;
+    FRESULT mk = FR_EXIST;
+    std::string candidate;
+    for (unsigned attempt = 0; attempt < 1000 && mk == FR_EXIST; ++attempt) {
+        char sdir[64];
+        snprintf(sdir, sizeof(sdir), "s_%s_%lld_%u", macStr, epoch, attempt);
+        candidate = root + "/" + sdir;
+        mk = f_mkdir(candidate.c_str());
+    }
+    FRESULT cd = mk == FR_OK ? sdCard->goToDir(candidate) : mk;
+    if (mk != FR_OK || cd != FR_OK) {
+        printf("#ERR:SD_DIR:%d,%d,%s\n", (int)mk, (int)cd, candidate.c_str());
+        return false;
+    }
+    sessionDir = candidate;
+    recIndex = 0;
+    sdOK = true;
+    printf("#SDIR:%s\n", sessionDir.c_str());
+#endif
+    return sdOK;
+}
+
+static bool sdPrepareRecording() {
+    const bool wasReady = sdOK;
+    sdFault = SdFault::None;
+    if ((wasReady || sdRecover()) && sdOpenFiles(sessionDir)) return true;
+    // The card may have been swapped while stopped. One recovery attempt;
+    // no repeated retries that can trap the operator in an endless countdown.
+    if (wasReady && sdRecover()) {
+        sdFault = SdFault::None;
+        if (sdOpenFiles(sessionDir)) return true;
+    }
+    if (sdFault.load() == SdFault::None) sdFault = SdFault::Init;
+    return false;
 }
 
 static void sdWriteTask(void*) {
@@ -680,7 +816,7 @@ static void sdWriteTask(void*) {
         SdCommand command;
         if (xQueueReceive(sdCommands, &command, filesOpen ? 0 : portMAX_DELAY) == pdTRUE) {
             if (command == SdCommand::Open) {
-                if (sdOK) sdOpenFiles(sessionDir);
+                sdCommandResult = sdPrepareRecording();
                 dirty = false;
                 lastSync = xTaskGetTickCount();
                 xSemaphoreGive(sdCommandDone);
@@ -702,6 +838,10 @@ static void sdWriteTask(void*) {
         int nI = nR < 0 || nE < 0 ? 0 : writeBatch(imuQ, imuBuf, 50, &filImu, "I", &imuDrops);
         int nL = nR < 0 || nE < 0 || nI < 0 ? 0 :
             writeBatch(labelQ, lblBuf, 8, &filMaster, "M", nullptr);
+        if (nR > 0) { sdRawRecords += nR; sdBytes += nR * sizeof(Sample); }
+        if (nE > 0) { sdEnvRecords += nE; sdBytes += nE * sizeof(Sample); }
+        if (nI > 0) { sdImuRecords += nI; sdBytes += nI * sizeof(ImuSample); }
+        if (nL > 0) sdBytes += nL * sizeof(LabelEvent);
         if (nR < 0 || nE < 0 || nI < 0 || nL < 0) {
             sdCloseFiles();
             discardPending();
@@ -1037,7 +1177,7 @@ static void imuTask(void*) {
             const float* gy = imu->getGyro();
             float temp = imu->getTemperature();
 
-            ImuSample s;
+            ImuSample s{}; // also initialize the on-disk/on-wire reserved word
             s.ts = recordingTimestampUs();
             // Store as raw int16 scaled: accel in milli-g, gyro in deci-dps
             s.ax = (int16_t)(ac[0] * 1000.0f);
@@ -1050,6 +1190,9 @@ static void imuTask(void*) {
             if (sdOK.load(std::memory_order_relaxed) && xQueueSend(imuQ, &s, 0) != pdTRUE)
                 imuDrops.fetch_add(1, std::memory_order_relaxed);
             if (netStreamActive()) netEnqueueImu(s);
+            ++imuSamples;
+        } else {
+            ++imuReadErrors;
         }
 
         xSemaphoreGive(imuRunMutex);
@@ -1064,10 +1207,10 @@ static int  feedUartByte(uint8_t b); // defined below; same parser the loops use
 static std::string sdListRoot();     // defined below; shared by 'F' and 'G'
 
 static bool countdown(int seconds) {
+    starting = true;
     for (int i = seconds; i > 0; i--) {
         printf("#CD:%d\n", i);
-        led->setColor(48, 20, 0);
-        led->turnOn();
+        updateStatusLed();
         // Keep the second based on elapsed time even when UART bytes arrive.
         const int64_t secondEnds = esp_timer_get_time() + 1000000;
         while (true) {
@@ -1087,7 +1230,7 @@ static bool countdown(int seconds) {
                 // only a genuinely standalone '0' can reach the abort test.
                 int c = feedUartByte(rx);
                 if (c == '0') {
-                    led->turnOff();
+                    starting = false;
                     printf("#CD:ABORT\n");
                     return false;   // aborted
                 }
@@ -1095,12 +1238,11 @@ static bool countdown(int seconds) {
                 // arms the selection, the ADCs aren't running yet.
                 if (c == 'S') handleSensorCommand();
             }
-            if (secondEnds - esp_timer_get_time() <= 500000 && led->isOn())
-                led->turnOff();   // first half on, second half off
+            updateStatusLed();
         }
     }
     printf("#CD:0\n");
-    led->turnOn();
+    starting = false;
     return true;   // completed normally
 }
 
@@ -1208,21 +1350,60 @@ static bool startRecording() {
     // Announce which sensor is live so the host doesn't have to infer it
     // from the CSV header (the selection persists across mode changes).
     if (mode == Mode::Sensor) printSensorLine();
+    if (!adcOK) {
+        printf("#ERR:ADC_UNAVAILABLE\n#STOP\n");
+        updateStatusLed();
+        return false;
+    }
+    recordingRate1000.store(limitFastRate1000, std::memory_order_relaxed);
+    resetDropCounters();
+#ifndef EMG8_NO_SD
+    if (!commandSdWriter(SdCommand::Open)) {
+        printf("#SD:FAIL,%s,0\n#ERR:SD_REQUIRED\n#STOP\n",
+               sdFaultName(sdFault.load()));
+        printSdSummary();
+        updateStatusLed();
+        return false;
+    }
+#endif
     if (!countdown(countdownSeconds)) {
+        commandSdWriter(SdCommand::Close);
+        printSdSummary();
         updateStatusLed();
         printf("#STOP\n");
         return false;
     }
     // battery->enable5V();  // battery/5V management not used on this board (read on ESP32 #2 instead)
-    recordingRate1000.store(limitFastRate1000, std::memory_order_relaxed);
-    resetDropCounters();
-    if (sdOK) commandSdWriter(SdCommand::Open);
+    if (!netBeginRecording()) {
+        commandSdWriter(SdCommand::Close);
+        printSdSummary();
+        printf("#ERR:STREAM_BOUNDARY\n#STOP\n");
+        return false;
+    }
     recStart.store(esp_timer_get_time(), std::memory_order_relaxed);
+    reportedWrap = 0;
     recording = true;
-    sendStartToSlave();
+    sdRecordingStarted = true;
+    if (!sendStartToSlave()) {
+        recording = false;
+        waitImuIdle();
+        sdRecordingStarted = false;
+        commandSdWriter(SdCommand::Close);
+        printSdSummary();
+        updateStatusLed();
+        printf("#STOP\n");
+        return false;
+    }
     saveMetadata(3, currentPhase, curGrasp, curRep, 0);
-    if (!startADCs()) return false;
+    saveMetadata(4, currentPhase, 0, 0, 0);
+    if (!startADCs()) {
+        sdRecordingStarted = false;
+        printSdSummary();
+        return false;
+    }
     updateStatusLed();
+    if (sdOK) printf("#SD:OK,%s,0\n", sdFileSet.c_str());
+    printf("#TSWRAP:0,0\n");
     printf("#REC\n");
     return true;
 }
@@ -1234,11 +1415,18 @@ static bool startRecording() {
 // ─────────────────────────────────────────────
 static void stopRecordingCore(bool notifySlave = false) {
     stopADCs();
+    if (recording) {
+        const uint64_t elapsed = recordingElapsedUs();
+        const uint32_t wrap = static_cast<uint32_t>(elapsed >> 32);
+        saveMetadata(4, currentPhase, static_cast<uint16_t>(wrap),
+                     static_cast<uint16_t>(wrap >> 16), static_cast<uint32_t>(elapsed));
+    }
     recording = false;
     waitImuIdle();
     // Notify the companion at acquisition end, before potentially slow SD I/O.
     stopCompanion(notifySlave);
     commandSdWriter(SdCommand::Close);
+    printSdSummary();
     printSampleCounts();
     // battery->disable5V();  // battery/5V management not used on this board (read on ESP32 #2 instead)
     updateStatusLed();
@@ -1255,6 +1443,44 @@ static void stopRecordingCore(bool notifySlave = false) {
 static void stopTest() {
     stopRecordingCore(true);
     printf("#STOP\n");
+}
+
+// Main-task only. Keep I/O and LED work outside acquisition callbacks.
+static void serviceRecordingSafety() {
+    static SdFault announced = SdFault::None;
+    SdFault fault = sdFault.load();
+#ifndef EMG8_NO_SD
+    if (recording && fault == SdFault::None) {
+        if (rawDrops.load() || envDrops.load() || imuDrops.load()) fault = SdFault::Overflow;
+        else if (metadataDrops.load()) fault = SdFault::Metadata;
+        if (fault != SdFault::None) sdFault = fault;
+    }
+#endif
+    if (fault != announced) {
+        announced = fault;
+        if (fault != SdFault::None)
+            printf("#SD:FAIL,%s,%llu\n", sdFaultName(fault),
+                   (unsigned long long)recordingElapsedUs());
+    }
+#ifndef EMG8_NO_SD
+    if (recording && (!sdOK || fault != SdFault::None)) {
+        printf("#STOPCAUSE:SD_%s\n", sdFaultName(fault));
+        stopTest(); // no further participant trials with a silently missing SD copy
+        return;
+    }
+#endif
+    if (recording) {
+        const uint64_t streamStarted = netTakeStreamStart();
+        if (streamStarted) printf("#STREAM:UDP,%llu\n", (unsigned long long)streamStarted);
+        const uint64_t elapsed = recordingElapsedUs();
+        const uint32_t wrap = static_cast<uint32_t>(elapsed >> 32);
+        if (wrap != reportedWrap && saveMetadata(4, currentPhase,
+                static_cast<uint16_t>(wrap), static_cast<uint16_t>(wrap >> 16),
+                static_cast<uint32_t>(elapsed))) {
+            reportedWrap = wrap;
+            printf("#TSWRAP:%lu,%llu\n", (unsigned long)wrap, (unsigned long long)elapsed);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -1435,14 +1661,14 @@ static void processUartLine(const char* line, int len) {
             }
         }
         if (!valid || seconds < 1) printf("#ERR:COUNTDOWN:USE_C1_TO_C30\n");
-        else if (recording) printf("#ERR:BUSY\n");
+        else if (recording || starting) printf("#ERR:BUSY\n");
         else { countdownSeconds = seconds; printf("#CDCFG:%d\n", seconds); }
     } else if (line[0] == 'R') {
         if (strcmp(line, "R?") == 0) {
             printf("#RATE:%s\n", limitFastRate1000 ? "1000" : "max");
         } else if (strcmp(line, "R1000") != 0 && strcmp(line, "Rmax") != 0) {
             printf("#ERR:RATE:USE_R1000_OR_Rmax\n");
-        } else if (recording) {
+        } else if (recording || starting) {
             printf("#ERR:BUSY\n");
         } else {
             limitFastRate1000 = strcmp(line, "R1000") == 0;
@@ -1478,23 +1704,26 @@ static void processUartLine(const char* line, int len) {
         else { printf("#ERR:PHASE:USE_Pgrasp_Prest_Pdemo_OR_Psweep\n"); return; }
         // Main is the only producer; the SD consumer can only free more space.
         if (recording && sdOK && (!labelQ || uxQueueSpacesAvailable(labelQ) == 0)) {
+            ++metadataDrops;
             printf("#ERR:METADATA_QUEUE\n"); return;
         }
-        uint32_t timestamp = recordingTimestampUs();
+        const uint64_t timestamp = recording ? recordingElapsedUs() : 0;
         if (!companionPhase(next)) { printf("#ERR:LINK_QUEUE\n"); return; }
-        if (!saveMetadata(2, next, curGrasp, curRep, timestamp)) return;
+        if (!saveMetadata(2, next, curGrasp, curRep, static_cast<uint32_t>(timestamp))) return;
         currentPhase = next;
-        printf("#PHASE:%s\n", phaseName(currentPhase));
+        printf("#PHASE:%s\n#EVENT:PHASE,%s,%llu\n", phaseName(currentPhase),
+               phaseName(currentPhase), (unsigned long long)timestamp);
     } else if (line[0] == 'L') {
         uint16_t gid = 0, rep = 0;
         if (!parseLabel(line + 1, gid, rep)) {
             printf("#ERR:LABEL\n"); return;
         }
-        if (!saveMetadata(1, currentPhase, (uint16_t)gid, (uint16_t)rep,
-                          recordingTimestampUs())) return;
+        const uint64_t timestamp = recording ? recordingElapsedUs() : 0;
+        if (!saveMetadata(1, currentPhase, gid, rep, static_cast<uint32_t>(timestamp))) return;
         curGrasp = (uint16_t)gid;
         curRep = (uint16_t)rep;
-        printf("#LABEL:%d,%d\n", gid, rep);
+        printf("#LABEL:%d,%d\n#EVENT:LABEL,%u,%u,%llu\n", gid, rep, gid, rep,
+               (unsigned long long)timestamp);
     } else if (line[0] == 'G') {
         // File transfer: G<path as emitted by the 'F' listing>
         // El cuerpo del archivo sale por uart_write_bytes, que no pasa por
@@ -1502,7 +1731,7 @@ static void processUartLine(const char* line, int len) {
         // cabecera #FDATA y no sabria que hacer con ellos. Se destapa solo.
         if (hostUartQuiet()) { hostSetUartQuiet(false); printf("#UART:1,transfer\n"); }
         if (!sdOK) { printf("#ERR:NO_SD\n"); return; }
-        if (recording) { printf("#ERR:BUSY\n"); return; }
+        if (recording || starting) { printf("#ERR:BUSY\n"); return; }
         std::string fpath(line + 1, len - 1);
         // Trim trailing whitespace
         while (!fpath.empty() && (fpath.back() == '\r' || fpath.back() == ' '))
@@ -1773,62 +2002,8 @@ extern "C" void app_main() {
     probeReadyRouting();
 #endif
 
-    /* ---- SD card --------------------------------------------------------- */
-#ifndef EMG8_NO_SD
-    spiSD = new SPI(SPI::SpiMode::kMaster, SPI2_HOST, kSD_MOSI, kSD_MISO, kSD_SCK);
-    esp_err_t sdSpiErr = spiSD->init();
-    if (sdSpiErr != ESP_OK) {
-        printf("SD SPI bus init failed: %s\n", esp_err_to_name(sdSpiErr));
-    } else {
-        printf("SD SPI bus OK (MOSI=%d MISO=%d SCK=%d CS=%d)\n",
-               kSD_MOSI, kSD_MISO, kSD_SCK, kSD_CS);
-        sdCard = new SD(*spiSD, kSD_CS);
-        esp_err_t sdErr = sdCard->init();
-        if (sdErr != ESP_OK) {
-            printf("SD card init failed: %s (0x%x)\n", esp_err_to_name(sdErr), sdErr);
-        } else {
-            FRESULT fr = sdCard->mountCard();
-            if (fr != FR_OK) {
-                printf("SD mount failed: FRESULT=%d\n", fr);
-            } else {
-                sdOK = true;
-                printf("SD card mounted OK\n");
-            }
-        }
-    }
-    if (!sdOK)
-        printf("SD card NOT available\n");
-
-    // Uptime repeats after reboot. Never reuse an existing session directory.
-    if (sdOK) {
-        const std::string root = sdCard->getCurrentDir();
-        const long long epoch = esp_timer_get_time() / 1000000;
-        FRESULT mk = FR_EXIST;
-        std::string candidate;
-        for (unsigned attempt = 0; attempt < 1000 && mk == FR_EXIST; ++attempt) {
-            char sdir[64];
-            if (attempt == 0)
-                snprintf(sdir, sizeof(sdir), "s_%s_%lld", macStr, epoch);
-            else
-                snprintf(sdir, sizeof(sdir), "s_%s_%lld_%u", macStr, epoch, attempt);
-            candidate = root + "/" + sdir;
-            mk = f_mkdir(candidate.c_str());
-        }
-        FRESULT cd = mk == FR_OK ? sdCard->goToDir(candidate) : mk;
-        if (mk != FR_OK || cd != FR_OK) {
-            sdOK = false;  // No fallback into the root or an old recording.
-            printf("#ERR:SD_DIR:%d,%d,%s\n", (int)mk, (int)cd, candidate.c_str());
-        } else {
-            sessionDir = candidate;
-            printf("#SDIR:%s\n", sessionDir.c_str());
-        }
-    }
-
-#else
-    printf("#BENCH:SD_DISABLED\n");
-#endif
-    if (!sdOK) sdFault.store(SdFault::Init, std::memory_order_relaxed);
-
+    /* ---- SD card: recovery is also available after an absent-at-boot card. */
+    if (!sdRecover()) sdFault.store(SdFault::Init, std::memory_order_relaxed);
     /* ---- IMU (ICM-42605 over SPI3) --------------------------------------- */
     esp_log_level_set("ICM42605", ESP_LOG_DEBUG);
     spiIMU = new SPI(SPI::SpiMode::kMaster, SPI3_HOST, kIMU_MOSI, kIMU_MISO, kIMU_SCK);
@@ -1882,13 +2057,15 @@ extern "C" void app_main() {
     configASSERT(rawQ && envQ && imuQ && labelQ);
     imuRunMutex = xSemaphoreCreateMutex();
     configASSERT(imuRunMutex);
-    if (sdOK) {
+#ifndef EMG8_NO_SD
+    {
         sdCommands = xQueueCreate(1, sizeof(SdCommand));
         sdCommandDone = xSemaphoreCreateBinary();
         configASSERT(sdCommands && sdCommandDone);
         if (xTaskCreatePinnedToCore(sdWriteTask, "sd", 8192, nullptr, 5, nullptr, 1) != pdPASS)
             ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     }
+#endif
 
 
     /* ---- Status LED ------------------------------------------------------ */
@@ -1910,6 +2087,7 @@ extern "C" void app_main() {
     uint32_t lastLedMs = 0;
 
     while (mode == Mode::Idle) {
+        serviceRecordingSafety();
         uint32_t nowMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
         if (nowMs - lastLedMs >= 100) {
             lastLedMs = nowMs;
@@ -1983,28 +2161,6 @@ extern "C" void app_main() {
         }
     }
 
-    /* ==== Start recording ================================================= */
-    printf("#MODE:%d\n", (int)mode);
-    if (!countdown(countdownSeconds)) {
-        // Countdown aborted → go back to idle
-        mode = Mode::Idle;
-        printf("#STOP\n");
-        // Fall through to main loop but not recording
-    }
-
-    if (mode != Mode::Idle) {
-        // battery->enable5V();  // battery/5V management not used on this board (read on ESP32 #2 instead)
-        recordingRate1000.store(limitFastRate1000, std::memory_order_relaxed);
-        resetDropCounters();
-        if (sdOK) commandSdWriter(SdCommand::Open);
-        recStart.store(esp_timer_get_time(), std::memory_order_relaxed);
-        recording = true;
-        sendStartToSlave();
-        saveMetadata(3, currentPhase, curGrasp, curRep, 0);
-        updateStatusLed();
-        printf("#REC\n");
-    }
-
     xTaskCreatePinnedToCore(uartTask,     "uart", 4096, nullptr, 3, nullptr, 0);
     if (xTaskCreatePinnedToCore(adcBusTask,   "adc0", 4096, (void*)0, configMAX_PRIORITIES - 2, nullptr, 1) != pdPASS)
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
@@ -2021,16 +2177,23 @@ extern "C" void app_main() {
     printf("#DBG:IMU task disabled at build time\n");
 #endif
 
-    if (recording)
-        startADCs();
+    // A command/reed/button selects the mode in the wait loop. Only then do
+    // all start paths share the same storage preflight and ADC checks.
+    if (mode != Mode::Idle && !startRecording()) mode = Mode::Idle;
 
     /* ==== Main loop: monitor reed + UART ================================== */
     constexpr uint32_t kDebounceMs = 300;
     uint32_t lastToggle = 0;
     uint32_t lastHealthMs = 0;
+    uint32_t lastStatusMs = 0;
 
     while (true) {
         uint32_t nowMs = (uint32_t)(esp_timer_get_time() / 1000);
+        serviceRecordingSafety();
+        if (recording && nowMs - lastStatusMs >= 10000) {
+            lastStatusMs = nowMs;
+            printCompactStatus();
+        }
 
         if (nowMs - lastLedMs >= 100) {
             lastLedMs = nowMs;
@@ -2115,7 +2278,8 @@ extern "C" void app_main() {
                     }
                 }
             } else if (cmd == 'F') {
-                if (sdOK) {
+                if (recording || starting) printf("#ERR:BUSY\n");
+                else if (sdOK) {
                     listSDDir(sdListRoot().c_str());
                 }
             }

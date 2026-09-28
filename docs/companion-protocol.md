@@ -7,11 +7,11 @@ The monitor and auxiliary repositories are not modified by this change.
 
 460800 baud, 8N1. Send commands over UART; receive full acquisition data over
 UDP. CSV `D,` lines are latest-value snapshots (~50 Hz with Wi-Fi off, ~1 Hz
-with Wi-Fi enabled), not the acquisition sample rate. `U0` suppresses ordinary
-UART output, including acknowledgements, but leaves command reception active.
+with Wi-Fi enabled), not the acquisition sample rate. `U0` suppresses preview
+CSV and driver logs. Command reception, acknowledgements, status, faults, and
+save results remain active so a muted preview cannot conceal a failed session.
 Complete auxiliary lines still relay on UART0 at most once per second while
-recording. Use `U1` when acknowledgements are required; this does not disable
-UDP.
+recording, paired with `#AUXTS:<receipt_us>` even in U0. `U1` also restores preview CSV.
 
 The session commands are newline terminated and case sensitive:
 
@@ -93,15 +93,20 @@ the bracelet's measured sampling slowdown.
 ## SD metadata extension
 
 Sample/IMU records and UDP framing are unchanged. The 32-byte master header
-remains v4; byte 26 = 1 announces this metadata extension (0 = historical).
+remains v4; byte 26 = 2 announces the current metadata extension (0 = historical,
+1 = the original phase/event extension). Byte 27 = 1 announces wrap anchors.
 The 12-byte label/event layout is unchanged. Formerly reserved byte 8 stores
 phase (04 grasp, 05 rest, 06 demo); byte 9 stores event kind (1 label command,
-2 phase command, 3 recording-start snapshot). Bytes 10-11 remain zero.
-Every event contains current movement ID and repetition. The initial snapshot
+2 phase command, 3 recording-start snapshot, 4 clock-wrap anchor). Bytes 10-11 remain zero.
+Kinds 1-3 contain current movement ID and repetition. The initial snapshot
 has timestamp zero, so labels/phases set before recording are retained.
 
-Older readers can still stride these records but will see repeated labels for
-phase events; phase-aware readers must inspect the extension and event kind.
+For kind 4, bytes 4-7 instead carry the upper u32 of the recording clock,
+and bytes 0-3 carry its lower u32. Anchors are written at start, wrap, and stop.
+They must not be interpreted as labels. See `tools/sd_clock.py` and
+[the robustness update](robustness-2026-09.md) for the decoding rule and tests.
+
+Readers must inspect the extension and event kind, or reject an unknown extension.
 An exhausted metadata queue rejects the command with ERR:METADATA_QUEUE instead
 of acknowledging an unsaved transition. Invalid labels return ERR:LABEL.
 LINK counters from the status query are cumulative since boot; START/STOP/PHASE
@@ -169,15 +174,17 @@ kPa and temperature is degrees Celsius. The bracelet forwards the complete
 line with the same spelling, numeric text and point order to PC UART0 at
 460800 baud. These are separate lines; H/D CSV columns and UDP packets do
 not change. The monitor must recognize `imp:[` and `p1:` before its CSV
-handling. Keep UART reception connected and use `U1`, including with UDP on.
+handling. Keep UART reception connected, including with UDP on.
 
 While recording, pending auxiliary lines are emitted in batches at most
 once per second, independent of the EMG CSV divider. Lines are sent once;
 there is no repeated stale snapshot. Ana sends pressure/temperature every
 2000 ms during grasp, and a sweep on start/rest; 1 Hz forwarding does not
-create new measurements. No auxiliary timestamps, labels, sequence numbers,
-or checksums exist in this wire format. Laptop arrival time is NOT the
-sensor acquisition timestamp and cannot establish clock alignment.
+create new measurements. The bracelet now emits `#AUXTS:<receipt_us>` immediately
+before each unchanged line in one stdio write. The u64 stamp is captured when
+UART1 draining completes the line, before the relay heartbeat. There is still
+no auxiliary measurement timestamp or checksum. Receipt time includes auxiliary
+processing, UART serialization and task delay; it does not prove measurement alignment.
 This change relays live values only; it does not add auxiliary records
 to bracelet SD files. Ana's controller retains its own SD logging.
 
@@ -200,13 +207,13 @@ checksum undetected corruption remains possible. Finite buffering is not
 a lossless-delivery guarantee.
 
 Stopped recording discards completed pending lines. During recording, U0 only
-suppresses ordinary output; complete auxiliary lines continue through UART0 at
-the one-second relay heartbeat. Resume with `U1` for acknowledgements.
-Do not expect stop-time or quiet-period measurements to be replayed. SD
+suppresses preview CSV and driver logs; acknowledgements and complete auxiliary
+lines continue through UART0. The relay heartbeat remains one second.
+Stopped-period measurements are not replayed. SD
 binary downloads hold the stdout stream lock through FDATA/body/FDONE so
 auxiliary/preview printf output cannot enter the binary payload.
 
 Status `?` adds `#AUX:RX=...,TX=...,BAD=...,DROP=...,MUTED=...,UARTERR=...`:
 counts since boot of accepted lines, complete host writes, rejected lines,
-buffer/host-write losses, lines discarded while quiet/stopped, and observed
+buffer/host-write losses, lines discarded while stopped, and observed
 UART error events. TX means accepted by host output, not monitor acknowledgement.

@@ -150,19 +150,19 @@ Modes can be switched at runtime via UART without rebooting. The reed switch tog
 
 | Color | Meaning |
 |-------|---------|
-| Dim slow color cycle | Idle, no host command received since boot |
+| Dim green/blue cycle | Idle, no host command received since boot |
 | Blue | Wi-Fi AP active while stopped |
 | Orange | UART command received since boot; Wi-Fi off and stopped |
 | Green | Recording |
 | Orange blink | Start countdown |
-| Purple | ADC fault |
-| Dim steady red | SD unavailable at boot |
-| Slow red flash | SD file-open fault |
-| Fast red flash | SD write, sync, or close fault |
+| Bright purple | ADC fault |
+| Bright red, 2 flashes/second | SD unavailable, I/O failure, or recording data lost; details on UART |
 
 The radio and UART colors show firmware state, not a physical link check. SD
 fault colors take precedence over recording and connection colors. The LED is
 updated by the main task only; SD writing merely records the fault state.
+Fault red uses 255/255 and remains visible while stopped and during SD command
+waits. A successful new storage preflight clears the SD fault.
 
 ## UART Interface
 
@@ -204,7 +204,7 @@ The firmware emits a mix of:
 | `V0` | `V0` | Disable 5V rail |
 | `W1` | `W1` | Enable WiFi SoftAP + UDP streaming |
 | `W0` | `W0` | Disable WiFi (prints `#NET` stats) |
-| `U0` / `U1` | `U0` | Mute / restore ordinary UART output; auxiliary lines and command reception stay active |
+| `U0` / `U1` | `U0` | Mute / restore preview CSV and driver logs; commands, status, faults, save results and auxiliary lines stay active |
 | `Pgrasp` / `Prest` / `Pdemo` | `Pgrasp\n` | Set session phase and notify the companion |
 | `Psweep` | `Psweep\n` | Repeat the auxiliary impedance sweep while recording in REST |
 | `P?` | `P?\n` | Query session phase |
@@ -240,7 +240,9 @@ the rate is lower; no values are duplicated or interpolated.
 After a long interruption the limiter discards accumulated catch-up credit.
 
 The 32-byte v4 master header uses previously reserved byte 25 for the rate:
-0 = max (including historical files), 1 = 1000 cap. Byte 26 announces the phase metadata extension (1); bytes 27-31 remain reserved.
+0 = max (including historical files), 1 = 1000 cap. Byte 26 is metadata extension
+2 (phase/label events plus clock-wrap anchors); byte 27 = 1 advertises the anchors.
+Bytes 28-31 remain reserved. Historical metadata extensions 0/1 remain readable.
 UDP and sample record layouts are unchanged.
 
 ### Bracelet → Host Responses
@@ -324,6 +326,13 @@ Notes for the Python datalogger:
 
 ### SD recording completion and errors
 
+Normal firmware requires working SD storage before a recording can start.
+The writer is available even after a failed boot mount. Each start verifies a
+new file set before the countdown and attempts one remount/reinitialization if
+needed. Failure returns `#ERR:SD_REQUIRED` and `#STOP`, without `#REC` or an
+auxiliary START. No file is deleted, formatted, or overwritten during recovery.
+The explicit `EMG8_NO_SD` benchmark builds remain available for SD-free tests.
+
 The writer opens a new file set before acquisition starts. Stop and pause
 acknowledgements follow ADC stop, completion of any in-flight IMU measurement,
 queue drain and file close. Once `#STOP` or `#PAUSE` arrives, files can be
@@ -333,13 +342,29 @@ is sent at acquisition end, ahead of potentially slow SD flushing.
 
 Writes must return both `FR_OK` and the full requested byte count. Write,
 sync or close failures print `#ERR:SD_<operation>:<file>,<FatFs code>,<requested>,<written>`
-and mark SD unavailable until reset. A code of zero with fewer bytes written
-is still a failure (for example, a full card). Acquisition and UDP can continue.
+and mark SD unavailable. A code of zero with fewer bytes written is still a
+failure (for example, a full card). The main task stops acquisition and notifies
+the auxiliary after an SD failure or any SD queue/metadata loss. The LED stays
+bright red. Reinsert a working card and issue a new start to attempt recovery.
 The storage drop counters also include queued records discarded after failure
 and records in a failed write batch whose persistence is uncertain; they are
 not an exact count of missing bytes. Existing files are never reopened for overwrite.
 Dirty files are synced at elapsed 500 ms intervals, and closed on stop.
 Successful sync/close is not a guarantee against card-internal failure or power loss.
+
+`#SD:OK,<file-set>,0` identifies a started recording; `#SD:FAIL,<reason>,<us>`
+announces failures. At stop, `#SDSUM:<file-set>,<raw>,<env>,<imu>,<bytes>,OK|INCOMPLETE`
+reports successful complete writes across all four files. `OK` requires final
+close/sync success and zero storage drops. `INCOMPLETE` counts are not a
+persistence guarantee. File-set `0:/s_<...>/000.bin` denotes `M000.bin`,
+`R000.bin`, `E000.bin`, `I000.bin` in that directory, not an extra file.
+Compare ADC counts with SD counts separately from UDP delivery, which may lose
+packets. SDK card timeouts can exceed 500 ms; recovery is one attempt, not a
+promise of a 500 ms wall-clock bound.
+
+See [the September robustness review](docs/robustness-2026-09.md) for the new
+UART event fields, host integration, remaining acquisition work, and required
+hardware acceptance tests before participant use.
 
 ## WiFi / UDP Streaming
 
@@ -404,8 +429,9 @@ Each recording start within a session directory `s_<MAC>_<epoch>/` produces one 
 | 18 | 6 | Device MAC address |
 | 24 | 1 | Mode (`1`=All, `2`=Raw, `3`=Env, `4`=Sensor test) |
 | 25 | 1 | Rate selection: 0=max, 1=1000 Hz average cap |
-| 26 | 1 | Metadata extension: 0=historical labels, 1=phase/event kind |
-| 27 | 5 | Reserved |
+| 26 | 1 | Metadata extension: 0=historical labels, 1=phase/event kind, 2=adds wrap anchors |
+| 27 | 1 | Wrap-anchor convention: 1 for metadata extension 2 |
+| 28 | 4 | Reserved |
 
 Metadata event (12 bytes, recording-start snapshot and each label/phase command received while recording):
 
@@ -415,8 +441,15 @@ Metadata event (12 bytes, recording-start snapshot and each label/phase command 
 | 4 | 2 | Grasp/movement ID |
 | 6 | 2 | Repetition |
 | 8 | 1 | Phase: 04=grasp, 05=rest, 06=demo (extension 1) |
-| 9 | 1 | Event kind: 1=label, 2=phase, 3=start snapshot |
+| 9 | 1 | Event kind: 1=label, 2=phase, 3=start snapshot, 4=wrap anchor (extension 2) |
 | 10 | 2 | Reserved |
+
+For kind 4, bytes 4-7 hold the upper 32 bits of elapsed microseconds in little
+endian; bytes 0-3 hold the lower 32 bits. This record is not a movement label.
+Anchors are written at start, at each detected wrap and at stop. Sample/IMU
+timestamps retain their existing u32 layout: unwrap independently per
+ADC/channel and IMU within each file set. `tools/sd_clock.py` is the reference
+decoder. Historical readers must recognize metadata extension 2 or reject it.
 
 **`R<nnn>.bin` / `E<nnn>.bin` — raw EMG / envelope: stream of 8-byte sample records, no header**
 
