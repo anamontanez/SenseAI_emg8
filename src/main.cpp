@@ -249,7 +249,8 @@ static std::atomic<SdFault> sdFault{SdFault::None};
 static std::atomic<uint32_t> metadataDrops{0}, imuSamples{0}, imuReadErrors{0};
 static uint32_t reportedWrap = 0;
 static bool starting = false;
-static bool uartHostSeen = false;                // UART0 has received a command since boot.
+static uint32_t uartLastCommandMs = 0;            // Recent UART0 command activity, for the LED only.
+static constexpr uint32_t kUartActivityHoldMs = 3000;
 
 // Separate queues for each stream → separate files
 static QueueHandle_t rawQ   = nullptr;         // raw EMG (ch 0,1)
@@ -384,28 +385,28 @@ static void updateStatusLed() {
     uint8_t red = 0, green = 0, blue = 0;
     bool on = true;
     const SdFault fault = sdFault.load(std::memory_order_relaxed);
-    if (fault != SdFault::None || !sdOK) {
+    const bool uartRecentlySeen = uartLastCommandMs != 0 &&
+        static_cast<uint32_t>(nowMs - uartLastCommandMs) < kUartActivityHoldMs;
+    if (fault != SdFault::None || !sdOK || !adcOK) {
         // Fault visibility wins over animation, connection, and countdown.
+        // Keep it steadily bright so a blink or dim phase cannot hide it.
         red = 255;
-        on = (nowMs / 250) % 2 == 0;
-    } else if (!adcOK) {
-        red = 160; blue = 128; // ADC fault: bright purple
     } else if (recording.load(std::memory_order_relaxed)) {
-        green = 32;
+        green = 200; // Recording: bright green.
     } else if (starting) {
-        red = 48; green = 20;
+        green = 128; blue = 180; // Countdown: cyan-blue pulse.
         on = (nowMs / 500) % 2 == 0;
     } else if (netStreamActive()) {
-        blue = 32; // Wi-Fi AP active
-    } else if (uartHostSeen) {
-        red = 32; green = 10; // UART command received; radio off
+        blue = 180; // Wi-Fi AP active.
+    } else if (uartRecentlySeen) {
+        red = 180; green = 56; // Recent UART command; expires after three seconds.
     } else {
-        // Dim idle cycle: walk one brightness step at a time from green to
-        // blue and back. The 8-second triangle has no hue jump at its wrap.
+        // Healthy/ready: smooth blue-green idle cycle, with enough intensity
+        // to read clearly. The 8-second triangle has no hue jump at its wrap.
         const uint32_t phase = nowMs % 8000;
         const uint32_t ramp = phase <= 4000 ? phase : 8000 - phase;
-        blue = static_cast<uint8_t>((12 * ramp + 2000) / 4000);
-        green = 12 - blue;
+        blue = static_cast<uint8_t>((64 * ramp + 2000) / 4000);
+        green = 64 - blue;
     }
     if (led->isOn() != on) {
         if (on) { led->setColor(red, green, blue); led->turnOn(); }
@@ -1979,7 +1980,7 @@ static int feedUartByte(uint8_t b) {
 
     // First byte of a potential command
     if (b == 'L' || b == 'G' || b == 'R' || b == 'P' || b == 'C') {
-        uartHostSeen = true;
+        uartLastCommandMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
         uartLineBuf[0] = (char)b;
         uartLinePos = 1;
         return 0;
@@ -1987,7 +1988,8 @@ static int feedUartByte(uint8_t b) {
 
     // Single-byte commands
     if ((b >= '0' && b <= '4') || b == '?' || b == 'D' || b == 'S' ||
-        b == 'V' || b == 'U' || b == 'W' || b == 'F') uartHostSeen = true;
+        b == 'V' || b == 'U' || b == 'W' || b == 'F')
+        uartLastCommandMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
     return b;
 }
 

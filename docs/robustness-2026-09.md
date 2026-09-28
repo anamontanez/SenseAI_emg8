@@ -42,10 +42,13 @@ physical-removal detection bound is claimed without a hardware test.
 
 The main task stops a live recording after SD I/O failure, sample-queue loss,
 or metadata-queue loss. It notifies the auxiliary, drains what can be saved,
-reports the result, and leaves the fault visible. Bright red (255,0,0), 250 ms
-on / 250 ms off, overrides idle/connection/countdown states and is refreshed
-while waiting for SD commands. A new successful start preflight clears it.
-ADC failure is bright purple. The dim green/blue idle animation is retained.
+reports the result, and leaves the fault visible. The LED now uses steady bright
+red for any SD or ADC fault, bright green while recording, a cyan-blue pulse
+during countdown, and a brighter slow blue/green animation when healthy and
+ready. Active Wi-Fi remains blue. UART orange now expires three seconds after
+the last command; it no longer latches for the full boot. The UART color means
+recent command activity, not confirmed link quality. A new successful start
+preflight clears the SD fault.
 
 Every start path now uses the same checks. The first boot start formerly had
 separate logic and could announce `#REC` before verifying ADC start. U0 no

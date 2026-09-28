@@ -1946,3 +1946,25 @@ and 267.2 ms. This is consistent with the IMU task losing time to higher-
 priority storage work, but we left the scheduler unchanged to protect the
 primary raw/SD path. The board finished idle with the SD mounted. Ana's
 auxiliary firmware and the monitor were not modified.
+
+## 2026-09-28 — Status LED was latched to orange
+
+The idle orange was caused by `uartHostSeen`: the LED interpreted “a UART
+command arrived at any time since boot” as the current UART-only state, and the
+flag was never cleared. Recent bench commands therefore left the bracelet
+orange indefinitely, even when recording had stopped. Replaced that boot-lifetime
+flag with a three-second recent-command timestamp.
+
+Made the visual states clearer: steady bright red for either SD or ADC faults,
+bright green while recording, cyan-blue pulse during countdown, blue while the
+Wi-Fi AP is active, and a brighter slow blue/green healthy-idle animation.
+UART orange now expires after three seconds. This preserves the existing idle
+color preference while removing the stale orange state and dim fault blink.
+
+Built `esp32-s3-storage-bench` successfully (72,312 bytes static RAM; 941,242
+bytes flash) and flashed COM5 with esptool hash verification. A non-resetting
+UART status query returned `#STATUS:0,0,1,1,0,0,0,0,0`: stopped, SD mounted,
+IMU present, and zero drop counters. The query was followed by the full
+three-second UART-color expiry. Physical LED brightness/color still needs the
+operator's visual confirmation. Only bracelet firmware/docs changed; neither
+the monitor nor Ana's auxiliary firmware was edited.
