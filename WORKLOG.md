@@ -1853,3 +1853,13 @@ successful mount and read of `test.txt` on this card. Today's `FR_NO_FILESYSTEM`
 is a later, distinct FAT geometry issue. No repair, reformat, or SD write was
 attempted; establish whether any card contents need recovery before considering
 repair.
+
+The operator authorized formatting after confirming that Windows showed no
+partition/filesystem. Quick-format `E:` as FAT32 with volume label `EMG8`;
+`format.com` completed successfully and reported 15.0 GB total. Windows now
+recognizes the volume as ready, read/write FAT32 with 16,087,252,992 total bytes
+(about 15 GiB) and 16,087,220,224 free bytes. This matches the ESP32 CSD's
+31,457,280 sectors of 512 bytes. The card's previous contents were erased by
+the authorized quick format. Firmware-side boot-sector geometry and mount are
+still unverified; next, reinsert it in the bracelet and run the existing
+read-only `D` diagnostic, then verify mount before attempting a recording.
