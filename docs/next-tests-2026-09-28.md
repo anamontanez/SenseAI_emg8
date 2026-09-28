@@ -229,7 +229,7 @@ actual ADC map, Idle rejection, and retry cleanup. The card diagnostic reads
 LBA 0 and plausible partition boot sectors twice through a DMA-capable buffer;
 it does not mount, format, write, or dump file contents.
 
-All 40 host checks pass, including a simulated writer close delayed beyond one
+All 41 host checks pass, including a simulated writer close delayed beyond one
 second and refusal for absent/incomplete save summaries. The
 `esp32-s3-storage-bench` firmware built and was
 flashed to MAC `24:EC:4A:36:87:70` on COM5. Static RAM is 72,996 bytes (22.3%);
@@ -258,12 +258,21 @@ what Windows reports; this does not by itself prove which component is wrong.
 No storage recording or UDP acceptance run was attempted after the firmware
 correctly refused the unavailable SD.
 
-Next, compare the reported size/volume geometry with Windows without writing
-to the card, then use a backed-up, known-good MBR/FAT32 card whose volume size
-matches its reported capacity. Preserve this card unchanged until its contents
-are backed up. Once mount succeeds, run the saved-file SD check first; only
-then proceed to 60-second SD-only and SD+UDP captures. A small follow-up
-firmware improvement is to distinguish `MOUNT` from `INIT` in `#SDSTATE` and
-`#SD:FAIL`: the current status says `FAILED,INIT` although the observed failure
-is precisely mount result 13. No analog-signal quality or physical LED
-visibility conclusion is possible with open sensor inputs and no camera view.
+The operator reports this card previously worked in this bracelet and was only
+used there since its last format. That history means we should verify the size
+reporting before changing the card. The follow-up firmware fix now distinguishes
+`MOUNT` from `INIT`; on COM5 the board reports `#SDSTATE:FAILED,MOUNT` and
+`#SD:FAIL,MOUNT,0` for the observed mount error 13. The updated image built at
+72,996 bytes static RAM and 948,646 bytes flash; BIN SHA256:
+`ED00C943A75EF04A438ECE672A597DFCC1430C3681DBC692E2D53CB24AE4BC7A`; ELF
+SHA256: `74A06D9FF797915926B3ACDB955AD765488A3D060A33D3EFA20D48C7F642D0BA`.
+The capture is `benchmarks/robustness-2026-09-28/sd-mount-label.jsonl`.
+
+Next, compare the card's capacity and volume size using a computer/card reader,
+without changing the card. In particular, check whether Windows sees a card
+near 16 GB or 64 GB. If they disagree, collect the raw CSD/CID and sector data
+before deciding whether a backed-up reformat or replacement is appropriate.
+Once mounting succeeds, run the saved-file SD check first; only then proceed
+to 60-second SD-only and SD+UDP captures. No analog-signal quality or physical
+LED visibility conclusion is possible with open sensor inputs and no camera
+view.

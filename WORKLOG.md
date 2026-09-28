@@ -1797,7 +1797,7 @@ No firmware or device changes in this review. The implementation order, evidence
 requirements and monitor handoff are in `docs/next-tests-2026-09-28.md`.
 
 The planned start guard, production ADC-plan validation, read-only SD sector
-diagnostics, and bounded/file-level bench checks were then implemented. All 40
+diagnostics, and bounded/file-level bench checks were then implemented. All 41
 host checks pass, including a simulated close delayed over one second.
 `esp32-s3-storage-bench` built at 72,996 bytes static RAM and
 948,834 bytes flash, then was flashed to the same board on COM5 (BIN SHA256
@@ -1814,3 +1814,14 @@ geometry rather than transient reads; no SD+UDP or sampling-rate acceptance
 run was performed without a mountable card. Full evidence and the next card
 comparison step are in `docs/next-tests-2026-09-28.md` and the ignored
 `benchmarks/robustness-2026-09-28/` captures.
+
+The operator reports the SD had worked in this bracelet and was not used
+elsewhere since the last format, so no reformat was attempted. Added an explicit
+`MOUNT` fault state; the flashed board now reports `#SDSTATE:FAILED,MOUNT` and
+`#SD:FAIL,MOUNT,0` for FR_NO_FILESYSTEM. The follow-up build used the same
+72,996 bytes of static RAM and 948,646 bytes flash (BIN SHA256
+`ED00C943A75EF04A438ECE672A597DFCC1430C3681DBC692E2D53CB24AE4BC7A`). The
+UART confirmation is in `benchmarks/robustness-2026-09-28/sd-mount-label.jsonl`.
+Next check: compare the card's reported physical capacity and Windows volume
+size without writing; collect more card identity/geometry evidence before
+deciding on a backed-up reformat or replacement.

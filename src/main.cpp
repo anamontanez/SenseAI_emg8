@@ -243,7 +243,7 @@ static volatile Mode mode      = Mode::Idle;
 static std::atomic<bool> recording{false};
 static std::atomic<int64_t> recStart{0};     // µs epoch for timestamps
 static std::atomic<bool> sdOK{false};           // Shared with the SD writer
-enum class SdFault : uint8_t { None, Init, Open, Write, Sync, Close, Overflow, Metadata };
+enum class SdFault : uint8_t { None, Init, Open, Write, Sync, Close, Overflow, Metadata, Mount };
 static std::atomic<SdFault> sdFault{SdFault::None};
 static std::atomic<uint32_t> metadataDrops{0}, imuSamples{0}, imuReadErrors{0};
 static uint32_t reportedWrap = 0;
@@ -287,6 +287,7 @@ uint64_t recordingElapsedUs() {
 static const char* sdFaultName(SdFault fault) {
     switch (fault) {
     case SdFault::Init: return "INIT";
+    case SdFault::Mount: return "MOUNT";
     case SdFault::Open: return "OPEN";
     case SdFault::Write: return "WRITE";
     case SdFault::Sync: return "SYNC";
@@ -823,17 +824,22 @@ static bool sdRecover() {
         spiSD = new SPI(SPI::SpiMode::kMaster, SPI2_HOST, kSD_MOSI, kSD_MISO, kSD_SCK);
     if (!spiReady) {
         esp_err_t err = spiSD->init();
-        if (err != ESP_OK) return false;
+        if (err != ESP_OK) {
+            sdFault.store(SdFault::Init, std::memory_order_relaxed);
+            return false;
+        }
         spiReady = true;
     }
     if (!sdCard) sdCard = new SD(*spiSD, kSD_CS);
     esp_err_t err = sdCard->init(); // releases any old disk/device registration
     if (err != ESP_OK) {
+        sdFault.store(SdFault::Init, std::memory_order_relaxed);
         printf("#ERR:SD_INIT:%s\n", esp_err_to_name(err));
         return false;
     }
     FRESULT fr = sdCard->mountCard();
     if (fr != FR_OK) {
+        sdFault.store(SdFault::Mount, std::memory_order_relaxed);
         printf("#ERR:SD_MOUNT:%d\n", (int)fr);
         diagnoseSdMount();
         return false;
@@ -2161,7 +2167,8 @@ extern "C" void app_main() {
 #endif
 
     /* ---- SD card: recovery is also available after an absent-at-boot card. */
-    if (!sdRecover()) sdFault.store(SdFault::Init, std::memory_order_relaxed);
+    if (!sdRecover() && sdFault.load(std::memory_order_relaxed) == SdFault::None)
+        sdFault.store(SdFault::Init, std::memory_order_relaxed);
     /* ---- IMU (ICM-42605 over SPI3) --------------------------------------- */
     esp_log_level_set("ICM42605", ESP_LOG_DEBUG);
     spiIMU = new SPI(SPI::SpiMode::kMaster, SPI3_HOST, kIMU_MOSI, kIMU_MISO, kIMU_SCK);

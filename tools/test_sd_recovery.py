@@ -7,6 +7,34 @@ import unittest
 
 
 class StorageRecovery(unittest.TestCase):
+    def test_mount_failure_has_a_distinct_reported_fault(self):
+        source = (Path(__file__).resolve().parents[1] / 'src/main.cpp').read_text(encoding='utf-8')
+        start = source.index('static const char* sdFaultName(SdFault fault) {')
+        end = source.index('static bool sendStartToSlave()', start)
+        name_function = source[start:end].replace(
+            'static const char* sdFaultName(SdFault fault)',
+            'constexpr const char* sdFaultName(SdFault fault)')
+        recovery_start = source.index('static bool sdRecover() {')
+        recovery_end = source.index('static bool sdPrepareRecording()', recovery_start)
+        recovery = source[recovery_start:recovery_end]
+        mount_path = recovery.split('FRESULT fr = sdCard->mountCard();', 1)[1].split(
+            'const std::string root', 1)[0]
+        self.assertIn('sdFault.store(SdFault::Mount', mount_path)
+        self.assertIn('printf("#ERR:SD_MOUNT:%d\\n"', mount_path)
+
+        harness = r'''
+enum class SdFault { None, Init, Open, Write, Sync, Close, Overflow, Metadata, Mount };
+''' + name_function + r'''
+static_assert(sdFaultName(SdFault::Init)[0]=='I' &&
+              sdFaultName(SdFault::Mount)[0]=='M', "mount label regression");
+'''
+        compiler = shutil.which('clang++')
+        self.assertIsNotNone(compiler)
+        with tempfile.TemporaryDirectory() as folder:
+            cpp = Path(folder) / 'sd_fault_names.cpp'
+            cpp.write_text(harness, encoding='utf-8')
+            subprocess.run([compiler, '-std=c++17', '-fsyntax-only', str(cpp)], check=True)
+
     def test_recovery_is_bounded_and_incomplete_is_not_ok(self):
         text = (Path(__file__).resolve().parents[1] / 'src/main.cpp').read_text(encoding='utf-8')
         prep = text.split('static bool sdPrepareRecording() {', 1)[1].split('static void sdWriteTask', 1)[0]

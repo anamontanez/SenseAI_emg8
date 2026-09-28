@@ -32,7 +32,7 @@ template<class T> struct Flag {
 };
 enum class Mode { Idle, All, Raw, Env, Sensor };
 enum class SdCommand { Open, Close };
-enum class SdFault { None, Init, Open, Write, Sync, Close, Overflow, Metadata };
+enum class SdFault { None, Init, Open, Write, Sync, Close, Overflow, Metadata, Mount };
 enum class SessionPhase { Demo };
 struct Text { constexpr const char* c_str() const { return "new/000.bin"; } };
 #define CHECK(c) do { if (!(c)) return __LINE__; } while(0)
