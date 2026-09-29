@@ -219,3 +219,37 @@ HARDWARE PASSED and MONITOR INTEGRATION PENDING. Give the user a concise
 ready/not-ready assessment grounded in those checks, and leave the board
 stopped with all handles/receivers released. Do not claim 300-user reliability
 or faultless UDP from a short bench pass.
+
+## Luna validation results — 2026-09-28
+
+- **BUILD PASSED:** the archived candidate had 47 offline checks passing
+  before this handoff. The app-only flash at `0x10000` completed and esptool
+  verified the write. BIN SHA256:
+  `8F42D1F24BE253DDBFCBF82B5AD8F9BDCC8F3876BC299906336BFF8415E8780D`;
+  running ELF SHA256:
+  `8748a4630c008042d69f079054f2418a5abc1dd963878c638613f69020b3085e`.
+- **HARDWARE PASSED — bounded bench scope:** SD-only BENCH_A (30 s) read back
+  exactly, with 1000.238–1000.438 Hz raw, 49.999 Hz envelope and 199.7 Hz IMU.
+  UDP+SD BENCH_B (60 s) had no UDP sequence gaps, duplicates, reordering or
+  invalid packets; SD and host samples matched both ways. Its SD summary was
+  479,415 raw, 23,968 envelope and 10,008 IMU records / 4,227,292 bytes, `OK`.
+  Storage drops, ADC I2C errors/retriggers, and firmware network ERR/DROP/
+  PAUSE/THROTTLE counters were zero. Loaded raw rate measured 997.88–999.34 Hz,
+  envelope 49.90–49.97 Hz and IMU 166.99 Hz. The 1000 mode is still a ceiling,
+  not a literal minimum. Re-reading all five BENCH_A files after BENCH_B showed
+  identical SHA256 hashes.
+- Identity lifecycle checks passed: missing/malformed/overlong identity
+  refusal, line recovery, countdown cancellation with identity retention,
+  same-tag retry, BUSY protection during countdown/recording, and free mode
+  without a sidecar. Final board status: idle, SD ready, `R1000`, `C10`, demo,
+  Wi-Fi off, UART on; COM5 was closed.
+- **MONITOR INTEGRATION PENDING:** ADC pins were open and the auxiliary board
+  was disconnected. Read-only inspection of `D:\PhD\Code\IA-Arm_Monitor`
+  found `#CNT` handling but no `J?`/identity/`#SESSION` handshake or `#SDSUM`
+  gate in backend/web code. The 11.4-minute monitor run was not performed, and
+  this bench result does not validate sEMG waveforms, companion sync or
+  300-user endurance.
+
+Full serial logs, summaries and read-backs are under
+`../benchmarks/participant-review-2026-09-28/`; see the 2026-09-28 Luna
+validation section in `../WORKLOG.md` for the per-run counts and caveats.

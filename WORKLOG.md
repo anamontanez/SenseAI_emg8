@@ -2019,3 +2019,62 @@ Flagged the stale lifecycle harness (missing sd_summary), COM availability,
 single UDP-subscriber behavior and UART readback time. No additional firmware
 changes, flash, or serial-port access during this handoff. Candidate remains
 2d58cb9, built with 47 offline tests passing; hardware acceptance is pending.
+
+## 2026-09-28 — Luna short hardware validation
+
+**BUILD PASSED:** the archived storage-bench candidate was built with 47
+offline checks before this handoff. This validation flashed only its app image
+at `0x10000`; esptool verified the write. BIN SHA256 is
+`8F42D1F24BE253DDBFCBF82B5AD8F9BDCC8F3876BC299906336BFF8415E8780D`; the
+running ELF reported `8748a4630c008042d69f079054f2418a5abc1dd963878c638613f69020b3085e`.
+No firmware source or auxiliary/monitor code was changed.
+
+**HARDWARE PASSED — bounded bench scope:** post-flash status matched the
+combined-I2C configuration and RDY pins 15/42/41/40, with SD ready, IMU
+present, rate 1000 and countdown 10. The 30-second SD-only BENCH_A run saved
+raw at 1000.238–1000.438 Hz, envelope at 49.999 Hz and IMU at 199.7 Hz. Its
+read-back contained 240,088 raw, 12,000 envelope and 5,991 IMU records
+(2,136,592 binary bytes); counts and byte totals matched, with zero I2C errors,
+retriggers or storage drops.
+
+The 60-second BENCH_B UDP+SD run received 2,756 raw, 537 envelope and 531 IMU
+packets with zero packet-sequence gaps, duplicates, reordering or invalid
+packets. Every received sample matched SD and every SD sample appeared in the
+host capture. `#SDSUM` reported 479,415 raw, 23,968 envelope and 10,008 IMU
+records (4,227,292 bytes), result `OK`; ADC counts matched and storage drops,
+I2C errors and retriggers were zero. Network ERR/DROP/PAUSE/THROTTLE counters
+were zero. Raw channels measured 997.88–999.34 Hz, envelope 49.90–49.97 Hz,
+and IMU 166.99 Hz. The 1000 setting remains a ceiling, not a demonstrated
+literal 1000 Hz minimum. The lowest recorded free heap was 14,084 bytes.
+Re-reading all five BENCH_A files after BENCH_B produced byte-identical SHA256
+hashes. The first UDP attempt stopped before recording because Windows denied
+the WLAN reconnect call without elevation; joining the saved profile elevated
+allowed the same test to pass.
+
+The identity lifecycle checks passed: missing, malformed and overlong tags
+were rejected; parser recovery worked; a cancelled countdown retained its tag
+and closed `INCOMPLETE`; retry used the same identity; changes were `BUSY`
+during countdown and recording; and explicit free mode created four files
+without a JSON sidecar. Final status was stopped, SD ready, `R1000`, `C10`,
+demo phase, Wi-Fi off and UART on. Test preparations at indices 002–004 and
+006 remain as small incomplete SD files; completed tagged tests used 005 and
+007, and the untagged smoke test used 008. No existing SD files were deleted.
+The first lifecycle-harness attempts had two local verifier bugs (a short
+quiet-period timeout and a `0:/` path-normalization mismatch); their cancellation
+sidecars were retained, and the final bounded harness completed all checks.
+ESP-IDF also printed `gpio_install_isr_service ... already installed` during
+starts. The firmware treats `ESP_ERR_INVALID_STATE` as the expected shared ISR
+service case; no reset or acquisition/SD error followed.
+
+**MONITOR INTEGRATION PENDING:** the ADC inputs were open and the auxiliary
+controller was disconnected, so these runs do not validate muscle signals or
+clock/phase delivery to the companion. Read-only inspection of
+`D:\PhD\Code\IA-Arm_Monitor` found `#CNT` support but no identity handshake
+(`J?`/`#IDENTITY`/`#SESSION`) or `#SDSUM` result gate in its backend/web code.
+The 11.4-minute monitor protocol was therefore not run. The short bench pass is
+not a 300-user reliability certification.
+
+Artifacts: `benchmarks/participant-review-2026-09-28/sd-A-30s/summary.json`,
+`benchmarks/participant-review-2026-09-28/udp-B-60s-retry/summary.json`,
+`benchmarks/participant-review-2026-09-28/live-validation/sd-A-reread-after-B/summary.json`,
+and `benchmarks/participant-review-2026-09-28/live-validation/lifecycle-final/summary.json`.
