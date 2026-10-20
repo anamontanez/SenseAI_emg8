@@ -4,37 +4,48 @@
 
 ## Hardware
 
+Board: **sEMG microcontroller v0.2**. The four ADCs are no longer on the
+controller board: each sensor board carries one ADS1015 and one IMU, and
+reaches the controller through one of the two bottom connectors (left:
+ADC1/ADC2 + IMU1/IMU2, right: ADC3/ADC4 + IMU3/IMU4).
+
 | Component | Part | Quantity |
 |-----------|------|----------|
 | MCU | ESP32-S3-WROOM-1-N8 | 1 |
-| ADC | ADS1015 (12-bit, 3300 SPS) | 4 |
-| IMU | ICM-42605 (6-axis) | 1 |
+| ADC | ADS1015 (12-bit, 3300 SPS), on the sensor boards | 4 |
+| IMU | ICM-42605 (6-axis), on-board | 1 |
+| IMU | Sensor-board IMUs, shared SPI bus | 4 |
 | Storage | MicroSD (SPI, FATFS) | 1 |
 | LED | WS2812 RGB | 1 |
-| Switch | Reed (normally open) | 1 |
+| Button | Push button (normally open, active low) | 1 |
 
-## Pin Map
+v0.2 has no reed switch; the button starts (short press) and stops (3 s hold).
+
+## Pin Map (v0.2)
 
 ### I2C (1 MHz)
 
 | Bus | SDA | SCL | Devices |
 |-----|-----|-----|---------|
-| I2C0 | GPIO6 | GPIO7 | ADC1 (0x48), ADC2 (0x49) |
-| I2C1 | GPIO45 | GPIO47 | ADC3 (0x48), ADC4 (0x49) |
+| I2C0 | GPIO4 | GPIO5 | ADC1 (0x48), ADC2 (0x49) |
+| I2C1 | GPIO2 | GPIO48 | ADC3 (0x48), ADC4 (0x49) |
+
+The 0x48/0x49 addresses are carried over from v0.1 (odd ADC with ADDR to GND,
+even ADC with ADDR to VCC). An ADC reported as missing at boot should first be
+checked for its ADDR strap on the sensor board.
 
 ### ADC ALERT/RDY Interrupts
 
-| ADC | Normal build GPIO | Attached bench GPIO |
-|-----|-------------------|---------------------|
-| ADC1 | GPIO40 | GPIO15 |
-| ADC2 | GPIO41 | GPIO42 |
-| ADC3 | GPIO42 | GPIO41 |
-| ADC4 | GPIO15 | GPIO40 |
+| ADC | GPIO |
+|-----|------|
+| ADC1 | GPIO6 |
+| ADC2 | GPIO7 |
+| ADC3 | GPIO9 |
+| ADC4 | GPIO15 |
 
-The measured bench routing differs from the original normal-build map.
-Diagnostic and throughput bench builds use the measured column. The normal
-map remains unchanged pending confirmation that this wiring matches the actual
-bracelet; see [acquisition review](docs/acquisition-review.md).
+The default storage-bench build triggers each ADC once at boot and prints
+`#RDYPROBE` lines showing which ready input actually fell, so the routing is
+checked on every flash.
 
 ### SD Card (SPI2)
 
@@ -45,23 +56,38 @@ bracelet; see [acquisition review](docs/acquisition-review.md).
 | SCK | GPIO12 |
 | MISO | GPIO13 |
 
-### IMU — ICM-42605 (SPI3)
+### IMUs (SPI3, shared bus)
 
-| Signal | GPIO |
-|--------|------|
-| MOSI | GPIO35 |
-| SCK | GPIO36 |
-| MISO | GPIO37 |
-| CS | GPIO38 |
-| FSYNC | GPIO39 |
-| INT | GPIO16 |
+MOSI GPIO35 · SCK GPIO36 · MISO GPIO37
+
+| IMU | CS | INT |
+|-----|----|-----|
+| On-board | GPIO38 | not routed |
+| IMU1 (with ADC1) | GPIO21 | GPIO1 |
+| IMU2 (with ADC2) | GPIO40 | GPIO14 |
+| IMU3 (with ADC3) | GPIO41 | GPIO39 |
+| IMU4 (with ADC4) | GPIO42 | GPIO47 |
+
+All five CS lines are driven high at boot before the first SPI3 transfer, so an
+IMU that has not been initialized yet cannot answer on the shared MISO.
+
+### UARTs
+
+| Port | TX | RX | Connected to |
+|------|----|----|--------------|
+| UART0 | GPIO43 | GPIO44 | CP2102 programming/host header (460800 baud) |
+| UART1 | GPIO17 | GPIO18 | `UART` connector, auxiliary measurement ESP (115200 baud) |
 
 ### Peripherals
 
 | Device | GPIO |
 |--------|------|
-| WS2812 RGB LED | GPIO2 |
-| Reed Switch | GPIO9 |
+| WS2812 RGB LED | GPIO45 (strapping pin, see below) |
+| Button | GPIO8 |
+
+GPIO45 selects the flash voltage at reset. The WS2812 input does not pull it
+high, so the 3.3 V flash of the N8 module boots normally; do not add a pull-up
+on that line.
 
 ## Channel Layout (per ADC)
 
@@ -106,7 +132,7 @@ Core 0                          Core 1
 - **UDP sender** (core 0, priority 5): drains bounded raw/envelope/IMU queues and batches version-1 datagrams. Raw data may send two packets per pass only while catching up; envelope and IMU remain limited to one. Failed sends retain their batch for a later retry. Radio shutdown waits for the sender to finish its current iteration before closing its resources.
 - **SD writer** (core 1, priority 5): Drains the sample queues in batches (raw 500 × 8 B ≈ 4 KB). One file set (`R<nnn>.bin`, …) per recording start within the session directory.
 - **UART CSV** (core 0, priority 3): Prints latest readings at ~50 Hz with auto-adjusted column headers per mode, reduced to ~1 Hz while the radio is active.
-- **Main loop** (core 0): Monitors UART commands and reed switch for mode changes, start/stop, and pause/resume.
+- **Main loop** (core 0): Monitors UART commands and the start/stop button for mode changes and start/stop.
 
 ## Acquisition Modes
 
@@ -144,7 +170,7 @@ Select with `S<n>` (`S0`–`S7`). Wire details:
 
 The CSV stream carries a single EMG column in this mode, named `s<n>_adc<a>_<ch>`, e.g. `H,ts_us,s3_adc2_3,ax,...,label,rep`. Because that column name encodes the sensor, a live `S<n>` switch **reprints the `H` header** even though the mode hasn't changed — parse each `H` line rather than caching the first one. Samples still land in `R<nnn>.bin` tagged with their real ADC and channel indices, so recordings stay self-describing.
 
-Modes can be switched at runtime via UART without rebooting. The reed switch toggles between pause and resume (defaults to All mode on first press).
+Modes can be switched at runtime via UART without rebooting. A short button press starts All mode; holding it 3 s stops the test. v0.2 has no physical pause/resume (the v0.1 reed switch is gone).
 
 ## LED Status
 
@@ -527,24 +553,23 @@ pio device monitor -b 460800   # serial monitor (app UART runs at 460800, not th
 
 The custom [partitions.csv](partitions.csv) provides a 3 MB app partition on
 the 8 MB flash. The default environment is now `esp32-s3-storage-bench`: real SD, combined
-I2C transfers and the physically verified ready mapping 15/42/41/40.
-The explicitly selected `esp32-s3-devkitc-1` environment retains the historical
-40/41/42/15 wiring and separate I2C path; it does not match this attached board.
+I2C transfers and the boot `#RDYPROBE` routing check. All environments use the
+single v0.2 pin map (ready 6/7/9/15); the v0.1 maps live in git history.
 A status query prints `#CONFIG` with the actual I2C path and pin mapping.
 
 ### SD-free sampling benchmarks
 
 | Environment | I2C path | Ready map | Detailed timing | SD |
 |-------------|----------|-----------|-----------------|----|
-| `esp32-s3-devkitc-1` | Separate, modern driver | Original | Off | Normal |
-| `esp32-s3-bench` | Separate, modern driver | Measured bench | On | Disabled |
-| `esp32-s3-legacy-bench` | Combined read then trigger | Measured bench | On | Disabled |
-| `esp32-s3-throughput-bench` | Combined read then trigger | Measured bench | Off | Disabled |
-| `esp32-s3-storage-bench` (default) | Combined read then trigger | Verified 15/42/41/40 | Boot routing probe | Enabled |
+| `esp32-s3-devkitc-1` | Separate, modern driver | v0.2 | Off | Normal |
+| `esp32-s3-bench` | Separate, modern driver | v0.2 | On | Disabled |
+| `esp32-s3-legacy-bench` | Combined read then trigger | v0.2 | On | Disabled |
+| `esp32-s3-throughput-bench` | Combined read then trigger | v0.2 | Off | Disabled |
+| `esp32-s3-storage-bench` (default) | Combined read then trigger | v0.2 | Boot routing probe | Enabled |
 
 The combined path uses the ESP-IDF legacy I2C driver. It is now selected by
-the default storage environment for this verified board. The other environments
-remain explicit comparisons; match the physical ready wiring before use.
+the default storage environment. The other environments remain explicit
+comparisons.
 Build it with `pio run -e esp32-s3-throughput-bench`; wait for the whole build
 to finish and verify the flashed image before measuring.
 

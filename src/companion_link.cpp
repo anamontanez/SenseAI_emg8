@@ -129,7 +129,9 @@ void companionInit() {
     ESP_ERROR_CHECK(uart_driver_install(kPort, kRxBufferBytes, kTxBufferBytes,
                                         16, &companionRxEvents, 0));
     ESP_ERROR_CHECK(uart_param_config(kPort, &cfg));
-    ESP_ERROR_CHECK(uart_set_pin(kPort, GPIO_NUM_4, GPIO_NUM_5,
+    // Placa v0.2: conector "UART" (TX0 = GPIO17, RX0 = GPIO18). En la v0.1
+    // iba en 4/5, que ahora son el I2C de ADC1/ADC2.
+    ESP_ERROR_CHECK(uart_set_pin(kPort, GPIO_NUM_17, GPIO_NUM_18,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     events = xQueueCreate(32, sizeof(Event));
     if (!events || xTaskCreatePinnedToCore(linkTask, "companion", 3072, nullptr,

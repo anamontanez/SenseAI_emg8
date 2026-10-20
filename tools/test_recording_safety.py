@@ -10,10 +10,9 @@ class RecordingSafety(unittest.TestCase):
     def test_start_and_runtime_faults(self):
         src = (Path(__file__).resolve().parents[1] / "src/main.cpp").read_text(encoding="utf-8")
         self.assertIn("if (mode != Mode::Idle) startRecording();", src)
-        reed_start = src.index("// ---- Reed switch toggle")
-        reed_end = src.index("// ---- Physical backup/OR button", reed_start)
-        reed = src[reed_start:reed_end]
-        self.assertIn("if (mode == Mode::Idle) mode = Mode::All;", reed)
+        # v0.2 has no reed switch; the button's short press is the physical start.
+        button = src[src.index("static void procesarEstadoBoton("):src.index("static void checkStartButton()")]
+        self.assertIn("mode = Mode::All;\n            startRecording();", button)
         start = src[src.index("static bool startRecording() {"):src.index("// ─", src.index("static bool startRecording() {"))]
         safety = src[src.index("static void serviceRecordingSafety() {"):src.index("// ─", src.index("static void serviceRecordingSafety() {"))]
         # Local-static cache is per simulated board instead of per executable.

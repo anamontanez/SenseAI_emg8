@@ -8,7 +8,10 @@
  *
  * ICM-42605 6-axis IMU at 200 Hz via SPI
  *
- * Multi-file SD logging  ·  UART CSV @460800  ·  Reed switch + serial commands
+ * Multi-file SD logging  ·  UART CSV @460800  ·  Button + serial commands
+ *
+ * Hardware: sEMG microcontroller v0.2 -- ADCs and four extra IMUs live on the
+ * sensor boards; see the pin map below.
  *
  * SD layout per session directory  s_<MAC>_<epoch>/  (one set per recording,
  * <nnn> increments on every recording start — pause/resume never truncates)
@@ -57,7 +60,6 @@
 #include "ADS1015.hpp"
 #include "ICM42605.hpp"
 #include "actuators_sense.hpp"
-#include "switch_sense.hpp"
 #include "sd_storage_sense.hpp"
 #include "spi_gp_sense.hpp"
 #include "BatteryManager.hpp"
@@ -68,22 +70,32 @@
 #include "bench_clock_probe.hpp"
 #endif
 
+/*
+ * Placa "sEMG microcontroller v0.2". Los cuatro ADS1015 ya no estan en el
+ * cerebro: cada uno vive en su placa de sensor (con su IMU) y llega por uno
+ * de los dos conectores inferiores. Cada conector lleva un bus I2C para dos
+ * ADC y dos IMU sobre el SPI compartido:
+ *   conector izquierdo -> ADC1/ADC2 + IMU1/IMU2   (I2C0: SDA 4, SCL 5)
+ *   conector derecho   -> ADC3/ADC4 + IMU3/IMU4   (I2C1: SDA 2, SCL 48)
+ * Las direcciones I2C (ADC impar en GND = 0x48, par en VCC = 0x49) se
+ * mantienen de la v0.1; si una placa de sensor no responde, revisar primero
+ * su puente ADDR.
+ */
+
 // I2C Bus 0 → ADC1 (ADDR_GND), ADC2 (ADDR_VCC)
-static constexpr gpio_num_t kSDA0 = GPIO_NUM_6;
-static constexpr gpio_num_t kSCL0 = GPIO_NUM_7;
+static constexpr gpio_num_t kSDA0 = GPIO_NUM_4;
+static constexpr gpio_num_t kSCL0 = GPIO_NUM_5;
 
 // I2C Bus 1 → ADC3 (ADDR_GND), ADC4 (ADDR_VCC)
-static constexpr gpio_num_t kSDA1 = GPIO_NUM_45;
-static constexpr gpio_num_t kSCL1 = GPIO_NUM_47;
+static constexpr gpio_num_t kSDA1 = GPIO_NUM_2;
+static constexpr gpio_num_t kSCL1 = GPIO_NUM_48;
 
-// ALERT / RDY per ADC. Bench routing measured with isolated conversions.
+// ALERT / RDY per ADC, in ADC order. Un solo mapa: en la v0.1 habia dos
+// (el de banco medido y el original) porque el cableado no coincidia con el
+// esquema; en la v0.2 sale directo del pinout. probeReadyRouting() lo
+// verifica en el arranque de las builds de banco.
 static constexpr gpio_num_t kRDY[] = {
-#if defined(EMG8_ADC_TIMING) || defined(EMG8_BENCH_RDY_MAP)
-    GPIO_NUM_15, GPIO_NUM_42, GPIO_NUM_41, GPIO_NUM_40
-#else
-    // Preserve the bracelet default until its wiring is confirmed.
-    GPIO_NUM_40, GPIO_NUM_41, GPIO_NUM_42, GPIO_NUM_15
-#endif
+    GPIO_NUM_6, GPIO_NUM_7, GPIO_NUM_9, GPIO_NUM_15
 };
 
 // SD Card (SPI2)
@@ -92,35 +104,38 @@ static constexpr gpio_num_t kSD_MOSI = GPIO_NUM_11;
 static constexpr gpio_num_t kSD_SCK  = GPIO_NUM_12;
 static constexpr gpio_num_t kSD_MISO = GPIO_NUM_13;
 
-// Peripherals
-static constexpr gpio_num_t kLED  = GPIO_NUM_2;   // WS2812 RGB
-static constexpr gpio_num_t kREED = GPIO_NUM_9;    // Reed switch
+// Peripherals. La v0.2 no tiene reed switch: su antiguo GPIO9 es ahora
+// ADC3_RDY y el boton de GPIO8 cubre arrancar/parar.
+// GPIO45 es pin de arranque (VDD_SPI): el WS2812 no lo levanta, asi que el
+// flash de 3,3 V del N8 sigue arrancando bien.
+static constexpr gpio_num_t kLED  = GPIO_NUM_45;  // WS2812 RGB
 
 // Physical backup/OR button:
 // short press starts the test, held 3+ sec stops it in a controlled
 // way. Pull-up (active LOW), NormallyOpen.
-//
-// NOTE: shares GPIO8 with kBAT_ADC below -- the battery voltage
-// divider is not wired up on this board revision, so the pin was
-// reassigned to the button instead. Because of this, botonIsrInit()
-// is called AFTER battery->init() in app_main() (see botonIsrInit()
-// and the BotonEdge/botonEdgeQ interrupt setup near checkStartButton()).
-
 static constexpr gpio_num_t kBOTON_INICIO = GPIO_NUM_8;
 
-// IMU SPI (SPI3 / VSPI)
+// IMU SPI (SPI3). Un solo bus para la IMU de la placa y las cuatro de las
+// placas de sensor; cada una con su CS.
 static constexpr gpio_num_t kIMU_MOSI = GPIO_NUM_35;
 static constexpr gpio_num_t kIMU_SCK  = GPIO_NUM_36;
 static constexpr gpio_num_t kIMU_MISO = GPIO_NUM_37;
-static constexpr gpio_num_t kIMU_CS   = GPIO_NUM_38;
-static constexpr gpio_num_t kIMU_INT  = GPIO_NUM_16;
+static constexpr gpio_num_t kIMU_CS   = GPIO_NUM_38;  // on-board IMU (sin INT ruteado)
 
-// Battery / Power (5V charging board) - Battery and charge information is
-// read on the other ESP32 (ESP32 #2), not used on this board.
-/*static constexpr gpio_num_t kBAT_ADC  = GPIO_NUM_8;   // %Bat voltage divider
-static constexpr gpio_num_t k5V_EN    = GPIO_NUM_14;  // 5V boost enable
-static constexpr gpio_num_t kCHG      = GPIO_NUM_5;   // Charge status (active LOW)
-static constexpr gpio_num_t kPGOOD    = GPIO_NUM_4;   // Power-good (active LOW)*/
+// IMU1..IMU4 en las placas de sensor, en el mismo orden que ADC1..ADC4.
+static constexpr int kNUM_EXT_IMUS = 4;
+static constexpr gpio_num_t kExtImuCs[kNUM_EXT_IMUS] = {
+    GPIO_NUM_21, GPIO_NUM_40, GPIO_NUM_41, GPIO_NUM_42
+};
+static constexpr gpio_num_t kExtImuInt[kNUM_EXT_IMUS] = {
+    GPIO_NUM_1, GPIO_NUM_14, GPIO_NUM_39, GPIO_NUM_47
+};
+
+// Battery / Power: la v0.2 no tiene divisor de bateria ni enable de 5 V
+// (eso lo lee el ESP32 #2). Los GPIO que usaba la v0.1 para ello (4, 5, 14)
+// ahora son I2C0 e IMU_INT2: no reactivar BatteryManager con esos pines.
+
+// Companion UART1 (ESP de medicion): TX GPIO17, RX GPIO18 -- see companion_link.cpp.
 
 /* ── Channel layout (NOT identical on every ADC) ───────────────────────────── */
 
@@ -232,9 +247,8 @@ static SD*      sdCard = nullptr;
 #endif
 static SPI*     spiIMU = nullptr;
 static RGB*     led    = nullptr;
-static Switch*  reedSw = nullptr;
 // Physical backup/OR button: interrupt-driven (see botonIsrInit() /
-// botonEdgeQ below), not a Switch* like reedSw -- a polled read can miss
+// botonEdgeQ below), not a polled Switch* -- a polled read can miss
 // a fast tap if the whole press+release happens between two loop
 // iterations; the GPIO interrupt guarantees every edge is captured.
 static BatteryManager* battery = nullptr;
@@ -1558,8 +1572,8 @@ static void handleSensorCommand() {
 
 // ─────────────────────────────────────────────
 //  Starts a recording (countdown + ADCs). Used from every place that
-//  can start a test once the background tasks already exist: reed
-//  switch, serial command 1-3, and the physical backup/OR button. The
+//  can start a test once the background tasks already exist: serial
+//  command 1-4 and the physical backup/OR button. The
 //  caller must set `mode` before calling it. Returns false if the
 //  countdown was aborted ('0' arrived during the wait).
 // ─────────────────────────────────────────────
@@ -1800,9 +1814,7 @@ static void IRAM_ATTR botonIsr(void*) {
 
 // Configures GPIO8 for interrupt-on-any-edge and registers botonIsr().
 // Called once from app_main(), replacing the earlier Switch-based
-// polling for this specific button (reedSw keeps using Switch/
-// isPressed() -- its gesture is a slow toggle, not at risk of a missed
-// fast edge the way the start/stop button was).
+// polling for this button.
 static void botonIsrInit() {
     botonEdgeQ = xQueueCreate(16, sizeof(BotonEdge));
 
@@ -2290,6 +2302,20 @@ extern "C" void app_main() {
         sdFault.store(SdFault::Init, std::memory_order_relaxed);
     /* ---- IMU (ICM-42605 over SPI3) --------------------------------------- */
     esp_log_level_set("ICM42605", ESP_LOG_DEBUG);
+    // Cinco IMU comparten MOSI/SCK/MISO. El driver SPI solo maneja el CS de
+    // los dispositivos que ya registro; uno sin registrar quedaria flotando y
+    // esa IMU podria contestar sobre MISO a la vez que la que se lee. Todos
+    // en alto antes del primer flanco de reloj.
+    {
+        gpio_config_t cs = {};
+        cs.pin_bit_mask = 1ULL << kIMU_CS;
+        for (gpio_num_t pin : kExtImuCs) cs.pin_bit_mask |= 1ULL << pin;
+        cs.mode = GPIO_MODE_OUTPUT;
+        // Nivel antes de habilitar la salida: evita un pulso bajo de CS.
+        gpio_set_level(kIMU_CS, 1);
+        for (gpio_num_t pin : kExtImuCs) gpio_set_level(pin, 1);
+        ESP_ERROR_CHECK(gpio_config(&cs));
+    }
     spiIMU = new SPI(SPI::SpiMode::kMaster, SPI3_HOST, kIMU_MOSI, kIMU_MISO, kIMU_SCK);
     esp_err_t imuSpiErr = spiIMU->init();
     if (imuSpiErr != ESP_OK) {
@@ -2311,10 +2337,6 @@ extern "C" void app_main() {
         }
     }
 
-    /* ---- Reed switch ----------------------------------------------------- */
-    reedSw = new Switch(kREED, Switch::SwitchMode::kNormallyOpen);
-    reedSw->init();
-
     /* ---- Battery manager (5V charging board) ------------------------------ */
     // NOTE: battery/5V management is not used on this board -- it's read on
     // the other ESP32 (ESP32 #2) instead. `battery` stays nullptr; every
@@ -2329,8 +2351,6 @@ extern "C" void app_main() {
     /* ---- Physical backup/OR button (moved from the measurement ESP) ------ */
     // Interrupt-driven (see botonIsrInit()/botonEdgeQ) instead of a
     // Switch/isPressed() poll -- a poll could miss a fast tap entirely.
-    // Initialized AFTER the battery manager on purpose: see the note next
-    // to kBOTON_INICIO's definition (shared GPIO8, digital config must win).
     botonIsrInit();
 
     /* ---- Sample queues --------------------------------------------------- */
@@ -2366,7 +2386,6 @@ extern "C" void app_main() {
     printf("#READY\n");
     printf("#MAC:%s\n", macStr);
 
-    bool reedPrev = reedSw->isPressed();
     uint8_t rxByte;
     uint32_t lastLedMs = 0;
 
@@ -2378,7 +2397,7 @@ extern "C" void app_main() {
             updateStatusLed();
         }
         // Check UART. Timeout kept short (was 50ms) so this loop -- and the
-        // button/reed checks below it -- run often enough to catch a fast
+        // button check below it -- run often enough to catch a fast
         // tap. At 50ms, a genuinely quick press-and-release could complete
         // entirely between two polls and never be seen at all.
         if (uart_read_bytes(UART_NUM_0, &rxByte, 1, pdMS_TO_TICKS(5)) > 0) {
@@ -2432,12 +2451,6 @@ extern "C" void app_main() {
                 }
             }
         }
-        // Check reed switch (rising edge)
-        bool reedNow = reedSw->isPressed();
-        if (reedNow && !reedPrev)
-            mode = Mode::All;
-        reedPrev = reedNow;
-
         // Physical backup/OR button (tap only, hold doesn't matter here:
         // nothing is recording yet to stop). Drains the interrupt-
         // captured edge queue instead of polling isPressed(), so a fast
@@ -2465,13 +2478,11 @@ extern "C" void app_main() {
     printf("#DBG:IMU task disabled at build time\n");
 #endif
 
-    // A command/reed/button selects the mode in the wait loop. Only then do
+    // A command/button selects the mode in the wait loop. Only then do
     // all start paths share the same storage preflight and ADC checks.
     if (mode != Mode::Idle) startRecording();
 
-    /* ==== Main loop: monitor reed + UART ================================== */
-    constexpr uint32_t kDebounceMs = 300;
-    uint32_t lastToggle = 0;
+    /* ==== Main loop: monitor button + UART ================================ */
     uint32_t lastHealthMs = 0;
     uint32_t lastStatusMs = 0;
 
@@ -2492,20 +2503,6 @@ extern "C" void app_main() {
             lastHealthMs = nowMs;
             printHealthLine();
         }
-
-        // ---- Reed switch toggle (with debounce) ----
-        bool reedNow = reedSw->isPressed();
-        if (reedNow && !reedPrev && (nowMs - lastToggle > kDebounceMs)) {
-            lastToggle = nowMs;
-            if (recording) {
-                stopRecordingCore();
-                printf("#PAUSE\n");
-            } else {
-                if (mode == Mode::Idle) mode = Mode::All;
-                startRecording();
-            }
-        }
-        reedPrev = reedNow;
 
         // ---- Physical backup/OR button (moved from the measurement ESP) ----
         // Short press starts; held 3s stops in a controlled way.

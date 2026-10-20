@@ -2078,3 +2078,25 @@ Artifacts: `benchmarks/participant-review-2026-09-28/sd-A-30s/summary.json`,
 `benchmarks/participant-review-2026-09-28/udp-B-60s-retry/summary.json`,
 `benchmarks/participant-review-2026-09-28/live-validation/sd-A-reread-after-B/summary.json`,
 and `benchmarks/participant-review-2026-09-28/live-validation/lifecycle-final/summary.json`.
+
+## 2026-10-20 — Pin map for sEMG microcontroller v0.2
+**Hecho:** firmware remapped to the v0.2 board (ADCs and four extra IMUs moved
+to the sensor boards). A scripted pin-by-pin check of `src/main.cpp` and
+`src/companion_link.cpp` against the v0.2 pinout image matched 28/28 signals
+with no duplicated GPIO: I2C0 SDA4/SCL5 (ADC1/2), I2C1 SDA2/SCL48 (ADC3/4),
+RDY 6/7/9/15, SD 10/11/12/13 (unchanged), LED GPIO45 (was 2), button GPIO8,
+IMU SPI 35/36/37 with CS 38 (on-board) and 21/40/41/42 (IMU1-4), IMU INT
+1/14/39/47, companion UART1 TX17/RX18 (was 4/5). The single v0.2 RDY map
+replaces the v0.1 normal/bench pair (`EMG8_BENCH_RDY_MAP` removed). The reed
+switch is gone (its GPIO9 is now ADC3_RDY); the button keeps start/stop, so
+there is no physical pause/resume. The on-board IMU INT (GPIO16) and FSYNC
+(GPIO39) of v0.1 are not routed on v0.2. All five IMU CS lines are now driven
+high before the first SPI3 transfer so an uninitialized sensor-board IMU cannot
+drive MISO. ADC addresses 0x48/0x49 and the per-ADC raw/envelope channel map
+are carried over from v0.1 and still need confirmation on the new sensor boards.
+Host suite: 47 passing (reed assertion replaced by the button start path).
+`pio run -e esp32-s3-storage-bench` OK: RAM 72,576 B, flash 942,386 B.
+**Artefactos:** none archived; build output only (`.pio/build/esp32-s3-storage-bench/`).
+**Pendiente:** hardware boot check on the v0.2 board; `#RDYPROBE` with the
+sensor bands; confirm ADDR straps and channel map on the new sensor boards.
+**Sin commitear:** nothing after this commit.
