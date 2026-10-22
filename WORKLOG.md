@@ -2100,3 +2100,76 @@ Host suite: 47 passing (reed assertion replaced by the button start path).
 **Pendiente:** hardware boot check on the v0.2 board; `#RDYPROBE` with the
 sensor bands; confirm ADDR straps and channel map on the new sensor boards.
 **Sin commitear:** nothing after this commit.
+
+## 2026-10-20 — Read the four sensor-board IMUs in the IMU task
+**Hecho:** `imuTask` now reads every IMU that passed init (on-board + IMU1-4,
+shared SPI3, 200 Hz each, 1 MHz SPI) in one 5 ms pass and tags each record with
+its index in `ImuSample` byte 18 (former padding; old files read 0 = on-board).
+A missing sensor-board IMU only clears its bit in the presence mask; boot
+prints `#IMU:<idx>,CS=<gpio>,OK|FAIL,<err>` and `#IMUS:MASK=`. Master header
+reserved byte 28 = IMU presence mask. `#IMURATE` keeps its on-board meaning;
+`#IMUS:MASK,COUNT=a/b/c/d/e,ERRORS=...` in status and after `#CNT` at stop.
+sEMG priority unchanged: ADC workers (MAX-2) > SD writer (5) > IMU (4), all
+core 1; the IMU uses SPI3, never the ADC I2C buses. Because any SD queue loss
+stops the recording, SD IMU queue 400 -> 1000 (~1 s at 1000 rec/s) and raw
+queue 12000 -> 10300 (~1.29 s; measured peak 1502), heap-neutral; SD IMU batch
+50 -> 125 so an IMU backlog drains. UDP IMU queue left at 100 (heap).
+Host tools key IMU records per index. New `tools/test_imu_scheduling.py`
+guards the priority order, per-index reading and queue/batch sizing; the
+pressure-threshold test now reads the real `kRAW_QLEN`. 50 host tests pass.
+Build OK: RAM 74,128 B (+1,552 static for the batch), flash 942,654 B.
+**Artefactos:** `.dist/emg8-v02-storage-bench.bin` (SHA256
+b84c5828a7dc566fda485571b1cb07f4c910c32f8801bd5cfdc3502e9400cdc0) and `.elf`;
+`.dist/archivo/2026-10-20_device-app-before-v02.bin` = 3 MB read of 0x10000
+from COM4 before flashing: app "Prueba_Boards", built Oct 18 2026, IDF 5.4.0.
+**Pendiente:** NOT flashed. After the backup read succeeded, three connection
+attempts on COM4 (CP2102 10C4:EA60) failed with "No serial data received", and
+a manual EN/IO0 pulse produced no ROM banner at 115200: check power/cable/TX.
+The device still runs Prueba_Boards. Then: boot check (#IMU lines, SD, LED on
+GPIO45), and with the bands: #RDYPROBE, ADDR straps, channel map, raw >= 1000 Hz
+per channel with all five IMUs (`bench_sd.py` / `bench_acquisition.py`).
+**Sin commitear:** src/main.cpp, src/emg8_types.hpp, README.md, WORKLOG.md,
+.gitignore, tools/bench_sd.py, tools/bench_acquisition.py,
+tools/test_network_priority.py, tools/test_imu_scheduling.py (new).
+
+## 2026-10-20 — v0.2 bring-up on hardware (brain + bands connected)
+**Hecho:** firmware boots on the v0.2 board (MAC 1CDBD48C8A60): SD READY,
+LED on GPIO45 works (steady red = ADC fault), `#RATE:max` is now the boot
+default (R1000 still selectable). Fixed my SPI3 bug: the S3's SPI3 has only 3
+hardware CS (`SOC_SPI_PERIPH_CS_NUM`), so IMU3/IMU4 failed with ESP_ERR_NO_MEM;
+all five IMUs now share one CS-less device and ICM42605 drives its CS GPIO
+(new shared-device constructor). Boot diagnostics added: `#CHIP` (eFuse PSRAM/
+flash/pkg) and `#I2CSCAN` per bus with idle SDA/SCL levels.
+Results (benchmarks/v02-bringup-2026-10-20/boot7.log): `#CHIP:PSRAM_CAP=0`
+(no octal PSRAM; GPIO35-37 free). All five IMUs read WHO_AM_I 0xFF (MISO
+stuck high, on-board IMU included). Both I2C buses idle high (SDA=1, SCL=1)
+but no address answers in 0x08-0x77; ADC1-4 not found. `#AUX UARTERR=1`.
+Bench notes: DTR/RTS auto-reset does not work on this setup (flash with
+BOOT+Reset by hand); open the port with pyserial defaults (DTR/RTS asserted)
+-- with both deasserted the app never answered and resets entered DOWNLOAD.
+**Artefactos:** `.dist/emg8-v02-storage-bench.bin` SHA256 4f8d75d1...5cab
+(diagnostic build, flashed by the user from source); earlier builds and the
+pre-v0.2 device app in `.dist/archivo/`; boot logs in benchmarks/v02-bringup-2026-10-20/.
+**Pendiente:** find why nothing answers on SPI3/I2C (sensor power/5V input,
+on-board IMU population, pins vs. the colleague's Prueba_Boards test, not
+found under D:\ or C:\Users\escob). Then rate validation in max with 5 IMUs.
+**Sin commitear:** phase-2 files listed above plus lib/sensors-library ICM42605
+(.hpp/.cpp), src/main.cpp diagnostics, .gitignore.
+
+## 2026-10-22 — Communication with all 8 band modules; handoff document
+**Hecho:** with both bands connected (benchmarks/v02-bringup-2026-10-20/boot15-eight-modules.log)
+all four ADCs answer on both buses (0x48/0x49; config write/readback C3C0,
+conversions and RDY edges, err=0) and all five IMUs answer on SPI3. Measured
+RDY routing is crossed vs. the controller silkscreen: ADC1(U5,0x48)->GPIO7,
+ADC2(U6,0x49)->GPIO6, ADC3->GPIO15, ADC4->GPIO9; firmware now uses kRDY={7,6,15,9}
+and the schematic addresses (0x48/0x49). IMU1/IMU3 read WHO_AM_I 0x44 only
+when both bands are connected (0x42 with one band): SCK signal integrity, all
+parts are ICM-42605 per the hardware team. With ADCs present the app stops
+answering after #MAC; RDY interrupts are now disabled until acquisition
+(untested). Added boot diagnostics #RDYLINE, #ADCCH, #IDLE; tools/capture_boot.py
+and tools/flash_noboot.py (does not flash yet). Handoff: v2-firmware-improvements.md.
+**Artefactos:** `.dist/emg8-v02-storage-bench.bin` SHA256 4b71ef11...e676 (not
+flashed); board runs `.dist/archivo/2026-10-22_..._diag2` (ELF 8101118f...).
+**Pendiente:** flashing without BOOT (DTR/RTS behaviour), load the new build,
+raw/env channel map via #ADCCH, SCK drive strength / 500 kHz test, rate validation.
+**Sin commitear:** see v2-firmware-improvements.md section 1.

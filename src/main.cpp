@@ -6,7 +6,7 @@
  *   ch 0, 2 = fast  (raw EMG   ≈ 554 Hz per channel)
  *   ch 1, 3 = slow  (envelope  ≈  28 Hz per channel)
  *
- * ICM-42605 6-axis IMU at 200 Hz via SPI
+ * Up to five ICM-42605 6-axis IMUs (on-board + IMU1..IMU4) at 200 Hz each via SPI
  *
  * Multi-file SD logging  ·  UART CSV @460800  ·  Button + serial commands
  *
@@ -55,6 +55,8 @@
 #include "driver/gpio_filter.h"
 #include "driver/gpio.h"  // gpio_config, gpio_install_isr_service, gpio_isr_handler_add (button ISR)
 #include "esp_mac.h"
+#include "esp_efuse.h"
+#include "esp_efuse_table.h"
 #include "ff.h"
 
 #include "ADS1015.hpp"
@@ -77,25 +79,32 @@
  * ADC y dos IMU sobre el SPI compartido:
  *   conector izquierdo -> ADC1/ADC2 + IMU1/IMU2   (I2C0: SDA 4, SCL 5)
  *   conector derecho   -> ADC3/ADC4 + IMU3/IMU4   (I2C1: SDA 2, SCL 48)
- * Las direcciones I2C (ADC impar en GND = 0x48, par en VCC = 0x49) se
- * mantienen de la v0.1; si una placa de sensor no responde, revisar primero
- * su puente ADDR.
+ * Esquematico de la banda: U5 (ADDR a GND, 0x48) digitaliza S1/S2 y saca su
+ * RDY por la red RDY1; U6 (ADDR a 3V3, 0x49) digitaliza S3/S4 por RDY2.
+ * Medido con #RDYPROBE (2026-10-22): RDY1 llega a GPIO7 y RDY2 a GPIO6 (bus 1:
+ * GPIO15 y GPIO9), al reves de los rotulos ADCn_RDY del cerebro. Se respetan
+ * las direcciones del esquematico y se cruzan los pines en kRDY.
  */
 
-// I2C Bus 0 → ADC1 (ADDR_GND), ADC2 (ADDR_VCC)
+// I2C Bus 0 → ADC1 (0x48), ADC2 (0x49)
 static constexpr gpio_num_t kSDA0 = GPIO_NUM_4;
 static constexpr gpio_num_t kSCL0 = GPIO_NUM_5;
 
-// I2C Bus 1 → ADC3 (ADDR_GND), ADC4 (ADDR_VCC)
+// I2C Bus 1 → ADC3 (0x48), ADC4 (0x49)
 static constexpr gpio_num_t kSDA1 = GPIO_NUM_2;
 static constexpr gpio_num_t kSCL1 = GPIO_NUM_48;
 
-// ALERT / RDY per ADC, in ADC order. Un solo mapa: en la v0.1 habia dos
-// (el de banco medido y el original) porque el cableado no coincidia con el
-// esquema; en la v0.2 sale directo del pinout. probeReadyRouting() lo
-// verifica en el arranque de las builds de banco.
+// ALERT / RDY per ADC, in ADC order. Medido, no tomado del rotulo del
+// cerebro (ver arriba); probeReadyRouting() lo verifica en cada arranque de
+// las builds de banco.
 static constexpr gpio_num_t kRDY[] = {
-    GPIO_NUM_6, GPIO_NUM_7, GPIO_NUM_9, GPIO_NUM_15
+    GPIO_NUM_7, GPIO_NUM_6, GPIO_NUM_15, GPIO_NUM_9
+};
+
+// I2C address per ADC, in ADC order (bus = ADC index / 2).
+static constexpr uint8_t kAdcAddr[4] = {
+    ADS1015::ADS111X_ADDR_GND, ADS1015::ADS111X_ADDR_VCC,
+    ADS1015::ADS111X_ADDR_GND, ADS1015::ADS111X_ADDR_VCC
 };
 
 // SD Card (SPI2)
@@ -130,6 +139,19 @@ static constexpr gpio_num_t kExtImuCs[kNUM_EXT_IMUS] = {
 static constexpr gpio_num_t kExtImuInt[kNUM_EXT_IMUS] = {
     GPIO_NUM_1, GPIO_NUM_14, GPIO_NUM_39, GPIO_NUM_47
 };
+
+// Indice de IMU = ImuSample::imu = bit en el mapa de presencia:
+// 0 = placa, 1..4 = IMU1..IMU4. SPI3 del S3 solo tiene tres CS por hardware
+// (SOC_SPI_PERIPH_CS_NUM), asi que las cinco comparten un dispositivo SPI sin
+// CS y el driver mueve su GPIO de CS por software.
+static constexpr int kNUM_IMUS = 1 + kNUM_EXT_IMUS;
+static constexpr gpio_num_t kImuCs[kNUM_IMUS] = {
+    kIMU_CS, kExtImuCs[0], kExtImuCs[1], kExtImuCs[2], kExtImuCs[3]
+};
+// 1 MHz, como la IMU de placa en la v0.1: las externas van por cable hasta la
+// banda. Cada lectura son ~130 us de polling a prioridad 4, por debajo de los
+// workers ADC, asi que subir el reloj solo devuelve CPU ociosa del core 1.
+static constexpr int kIMU_SPI_HZ = 1000000;
 
 // Battery / Power: la v0.2 no tiene divisor de bateria ni enable de 5 V
 // (eso lo lee el ESP32 #2). Los GPIO que usaba la v0.1 para ello (4, 5, 14)
@@ -171,7 +193,9 @@ static inline bool isRawCh(uint8_t adcId, uint8_t ch) {
 // per-channel counts and zero retriggers/I2C errors — this is the validated
 // configuration, do not change it without re-checking #CNT.
 static constexpr uint8_t kSLOW_DIV = 20;
-static bool limitFastRate1000 = true;   // Boot at 1000 Hz; copied to workers at start.
+// Arranca en max: el requisito es un minimo (raw >= 1000 Hz, envolvente
+// >= 50 Hz con todas las IMU leyendo), no un techo. R1000 sigue disponible.
+static bool limitFastRate1000 = false;  // Copied to workers at start.
 static int countdownSeconds = 10;        // UART C1..C30 changes the next start.
 static std::atomic<bool> recordingRate1000{false};  // SD header snapshot.
 static constexpr auto    kADC_RATE = ADS1015::ConfigRate::Rate_3300Hz;
@@ -252,8 +276,9 @@ static RGB*     led    = nullptr;
 // a fast tap if the whole press+release happens between two loop
 // iterations; the GPIO interrupt guarantees every edge is captured.
 static BatteryManager* battery = nullptr;
-static ICM42605*       imu     = nullptr;
-static bool            imuOK   = false;
+static ICM42605*       imuDev[kNUM_IMUS] = {};
+static uint8_t         imuMask = 0;      // IMUs that passed init; fixed after boot
+static bool            imuOK   = false;  // on-board IMU (#STATUS field, CSV preview)
 static bool            adcOK   = false;
 
 static volatile Mode mode      = Mode::Idle;
@@ -262,7 +287,8 @@ static std::atomic<int64_t> recStart{0};     // µs epoch for timestamps
 static std::atomic<bool> sdOK{false};           // Shared with the SD writer
 enum class SdFault : uint8_t { None, Init, Open, Write, Sync, Close, Overflow, Metadata, Mount };
 static std::atomic<SdFault> sdFault{SdFault::None};
-static std::atomic<uint32_t> metadataDrops{0}, imuSamples{0}, imuReadErrors{0};
+static std::atomic<uint32_t> metadataDrops{0};
+static std::atomic<uint32_t> imuSamples[kNUM_IMUS], imuReadErrors[kNUM_IMUS];  // per IMU index
 static uint32_t reportedWrap = 0;
 static bool starting = false;
 static uint32_t uartLastCommandMs = 0;            // Recent UART0 command activity, for the LED only.
@@ -273,9 +299,15 @@ static QueueHandle_t rawQ   = nullptr;         // raw EMG (ch 0,1)
 static QueueHandle_t envQ   = nullptr;         // envelope (ch 2,3)
 static QueueHandle_t imuQ   = nullptr;
 static QueueHandle_t labelQ = nullptr;         // LabelEvent from PC
-static constexpr int kRAW_QLEN  = 12000;       // ~1.45 s at 8.3 kSa/s; SD buffering first
+// Cualquier perdida en estas colas detiene la grabacion (serviceRecordingSafety),
+// asi que la IMU necesita el mismo orden de aguante ante una escritura lenta
+// de SD que el crudo. Con cinco IMU (1000 registros/s) la cola IMU crece de
+// 400 a 1000 y el crudo cede los mismos bytes: el heap con Wi-Fi activo ya
+// bajo a ~14 KB y no hay de donde sacar mas. El crudo sigue con ~7x el pico
+// medido (1502) y la peor escritura SD vista (267 ms) cabe en ambas.
+static constexpr int kRAW_QLEN  = 10300;       // ~1.29 s at 8 kSa/s; SD buffering first
 static constexpr int kENV_QLEN  = 1000;        // ≈ 2 s   @ ~460 Sa/s
-static constexpr int kIMU_QLEN  = 400;         // ≈ 2 s   @ 200 Hz
+static constexpr int kIMU_QLEN  = 1000;        // ≈ 1 s   @ 5 IMUs × 200 Hz
 static constexpr int kLABEL_QLEN = 32;
 
 // Label state (set by PC via 'L' command)
@@ -366,8 +398,10 @@ static void resetDropCounters() {
     envDrops.store(0, std::memory_order_relaxed);
     imuDrops.store(0, std::memory_order_relaxed);
     metadataDrops = 0;
-    imuSamples = 0;
-    imuReadErrors = 0;
+    for (int i = 0; i < kNUM_IMUS; ++i) {
+        imuSamples[i].store(0, std::memory_order_relaxed);
+        imuReadErrors[i].store(0, std::memory_order_relaxed);
+    }
 }
 
 static const char* resetReasonName(esp_reset_reason_t reason) {
@@ -461,6 +495,20 @@ static void printIdentityConfig() {
            nextIdentity.value.subject, nextIdentity.value.session);
 }
 
+/** #IMUS:MASK=<hex>,COUNT=<i0>/<i1>/<i2>/<i3>/<i4>,ERRORS=<...> — one field per
+ *  IMU index (0 = on-board, 1..4 = IMU1..IMU4); absent IMUs stay at 0. */
+static void printImuCounts() {
+    char counts[64], errors[64];
+    int pc = 0, pe = 0;
+    for (int i = 0; i < kNUM_IMUS; ++i) {
+        pc += snprintf(counts + pc, sizeof(counts) - pc, "%s%lu", i ? "/" : "",
+                       (unsigned long)imuSamples[i].load(std::memory_order_relaxed));
+        pe += snprintf(errors + pe, sizeof(errors) - pe, "%s%lu", i ? "/" : "",
+                       (unsigned long)imuReadErrors[i].load(std::memory_order_relaxed));
+    }
+    printf("#IMUS:MASK=0x%02X,COUNT=%s,ERRORS=%s\n", (unsigned)imuMask, counts, errors);
+}
+
 static void printCompactStatus() {
     uint16_t mv = 0;
     uint8_t pct = 0;
@@ -483,12 +531,15 @@ static void printCompactStatus() {
     printf("#SDSTATE:%s,%s\n", sdOK && sdFault.load() == SdFault::None ?
            (recording ? "WRITING" : "READY") : "FAILED",
            sdFaultName(sdFault.load()));
+    // #IMURATE keeps its single-IMU meaning (on-board IMU, index 0) so existing
+    // monitor parsing stays valid; #IMUS adds every IMU index.
     const uint64_t duration = recordingElapsedUs();
     printf("#IMURATE:TARGET=%u,COUNT=%lu,ERRORS=%lu,MILLIHZ=%llu\n",
-           kIMU_ODR_HZ, (unsigned long)imuSamples.load(),
-           (unsigned long)imuReadErrors.load(),
+           kIMU_ODR_HZ, (unsigned long)imuSamples[0].load(),
+           (unsigned long)imuReadErrors[0].load(),
            (unsigned long long)(recording && duration ?
-               uint64_t(imuSamples.load()) * 1000000000ULL / duration : 0));
+               uint64_t(imuSamples[0].load()) * 1000000000ULL / duration : 0));
+    printImuCounts();
 }
 
 static void printStatusLine() {
@@ -525,6 +576,7 @@ static void printSampleCounts() {
         if (!hostUartQuiet()) adc[a]->printTiming(a + 1);
 #endif
     }
+    printImuCounts();
 }
 
 /* One low-rate health line makes a long run diagnosable even when the reset
@@ -744,7 +796,8 @@ static bool sdOpenFiles(const std::string& base) {
     // Write master header (32 bytes, v4)
     // [0-3] "EMG8"  [4] ver=4  [5] nADC  [6] nCh  [7] div
     // [8-11] epoch_s(u32)  [12-13] bat_mV  [14] bat_%  [15] bat_state
-    // [16-17] imuODR(u16)  [18-23] MAC(6)  [24] mode  [25] rate cap  [26] metadata extension [27-31] reserved
+    // [16-17] imuODR(u16)  [18-23] MAC(6)  [24] mode  [25] rate cap  [26] metadata extension
+    // [27] wrap anchors  [28] IMU presence mask  [29-31] reserved
     uint8_t hdr[32] = {};
     memcpy(hdr, "EMG8", 4);
     hdr[4] = 4;                  // version
@@ -770,6 +823,7 @@ static bool sdOpenFiles(const std::string& base) {
     hdr[26] = 2;  // metadata extension 2: kinds 1..3 plus explicit wrap anchors
     hdr[27] = 1;  // wrap anchors: metadata kind 4 carries the high timestamp word
     hdr[25] = recordingRate1000.load(std::memory_order_relaxed) ? 1 : 0;  // v4 reserved byte: 0=max, 1=1000 Hz cap
+    hdr[28] = imuMask;  // v4 reserved byte: bit i = IMU index i present (0 in historical files)
 
     filesOpen = true;
     if (!sdWriteChecked(&filMaster, "M", hdr, sizeof(hdr)) ||
@@ -973,7 +1027,9 @@ static bool sdPrepareRecording() {
 static void sdWriteTask(void*) {
     // Single owner; keep batch storage off the task's call stack.
     static Sample rawBuf[500], envBuf[100];
-    static ImuSample imuBuf[50];
+    // 500 raw records span ~62 ms, in which five IMUs add ~62 records. The IMU
+    // batch must exceed that or an IMU backlog never drains after an SD stall.
+    static ImuSample imuBuf[125];
     static LabelEvent lblBuf[8];
     bool closing = false, dirty = false;
     TickType_t lastSync = xTaskGetTickCount();
@@ -1025,7 +1081,7 @@ static void sdWriteTask(void*) {
 
         int nR = writeBatch(rawQ, rawBuf, 500, &filRaw, "R", &rawDrops);
         int nE = nR < 0 ? 0 : writeBatch(envQ, envBuf, 100, &filEnv, "E", &envDrops);
-        int nI = nR < 0 || nE < 0 ? 0 : writeBatch(imuQ, imuBuf, 50, &filImu, "I", &imuDrops);
+        int nI = nR < 0 || nE < 0 ? 0 : writeBatch(imuQ, imuBuf, 125, &filImu, "I", &imuDrops);
         int nL = nR < 0 || nE < 0 || nI < 0 ? 0 :
             writeBatch(labelQ, lblBuf, 8, &filMaster, "M", nullptr);
         if (nR > 0) { sdRawRecords += nR; sdBytes += nR * sizeof(Sample); }
@@ -1071,7 +1127,7 @@ static void sdWriteTask(void*) {
             vTaskDelay(pdMS_TO_TICKS(20));
         } else if (!closing && uxQueueMessagesWaiting(rawQ) < 500 &&
                    uxQueueMessagesWaiting(envQ) < 100 &&
-                   uxQueueMessagesWaiting(imuQ) < 50 &&
+                   uxQueueMessagesWaiting(imuQ) < 125 &&
                    uxQueueMessagesWaiting(labelQ) < 8) {
             // Continuous tiny batches can keep this priority-5 task runnable
             // forever and starve the priority-4 IMU. With no significant
@@ -1196,9 +1252,10 @@ static void uartTask(void*) {
                 }
         }
         // Append IMU (latest measurement already done by imuTask)
+        // Preview shows the on-board IMU only; all five are in I.bin and UDP.
         if (imuOK) {
-            const float* ac = imu->getAccel();
-            const float* gy = imu->getGyro();
+            const float* ac = imuDev[0]->getAccel();
+            const float* gy = imuDev[0]->getGyro();
             p += snprintf(line + p, sizeof(line) - p,
                           ",%.3f,%.3f,%.3f,%.3f,%.3f,%.3f",
                           ac[0], ac[1], ac[2], gy[0], gy[1], gy[2]);
@@ -1411,7 +1468,16 @@ static void adcBusTask(void* arg) {
     }
 }
 
-/* ── IMU polling task — pinned to core 1, 200 Hz ──────────────────────────── */
+/* ── IMU polling task — pinned to core 1, 200 Hz per IMU ──────────────────── */
+/*
+ * Una pasada cada 5 ms lee, una tras otra, todas las IMU que pasaron el init
+ * (placa + IMU1..IMU4 sobre el mismo SPI3). Prioridad 4, por debajo de los
+ * workers ADC (MAX-2) y del escritor SD (5): una conversion lista siempre
+ * desaloja a esta tarea, incluso a mitad de una transferencia SPI (el polling
+ * no deshabilita interrupciones ni comparte bus con el I2C de los ADC). Si el
+ * core 1 se satura, lo que baja es la tasa IMU, nunca la de sEMG.
+ * Cada registro lleva su propio timestamp y su indice en ImuSample::imu.
+ */
 
 static void imuTask(void*) {
     constexpr TickType_t period =
@@ -1419,7 +1485,7 @@ static void imuTask(void*) {
     TickType_t wake = xTaskGetTickCount();
 
     while (true) {
-        if (!recording || !imuOK) {
+        if (!recording || !imuMask) {
             vTaskDelay(pdMS_TO_TICKS(100));
             wake = xTaskGetTickCount();
             continue;
@@ -1430,12 +1496,18 @@ static void imuTask(void*) {
             xSemaphoreGive(imuRunMutex);
             continue;
         }
-        if (imu->measure() == ESP_OK) {
-            const float* ac = imu->getAccel();
-            const float* gy = imu->getGyro();
-            float temp = imu->getTemperature();
+        for (int i = 0; i < kNUM_IMUS; ++i) {
+            if (!(imuMask & (1U << i))) continue;
+            ICM42605* dev = imuDev[i];
+            if (dev->measure() != ESP_OK) {
+                imuReadErrors[i].fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            const float* ac = dev->getAccel();
+            const float* gy = dev->getGyro();
+            float temp = dev->getTemperature();
 
-            ImuSample s{}; // also initialize the on-disk/on-wire reserved word
+            ImuSample s{}; // also initialize the on-disk/on-wire padding byte
             s.ts = recordingTimestampUs();
             // Store as raw int16 scaled: accel in milli-g, gyro in deci-dps
             s.ax = (int16_t)(ac[0] * 1000.0f);
@@ -1445,12 +1517,11 @@ static void imuTask(void*) {
             s.gy = (int16_t)(gy[1] * 10.0f);
             s.gz = (int16_t)(gy[2] * 10.0f);
             s.temp100 = (int16_t)(temp * 100.0f);
+            s.imu = (uint8_t)i;
             if (sdOK.load(std::memory_order_relaxed) && xQueueSend(imuQ, &s, 0) != pdTRUE)
                 imuDrops.fetch_add(1, std::memory_order_relaxed);
             if (netStreamActive()) netEnqueueImu(s);
-            ++imuSamples;
-        } else {
-            ++imuReadErrors;
+            imuSamples[i].fetch_add(1, std::memory_order_relaxed);
         }
 
         xSemaphoreGive(imuRunMutex);
@@ -2164,7 +2235,7 @@ static void probeReadyRouting() {
     auto writeWord = [](int a, uint16_t word) {
         uint8_t bytes[2] = {(uint8_t)(word >> 8), (uint8_t)word};
         I2C& bus = a < 2 ? i2c0 : i2c1;
-        return bus.write(0x48 + (a & 1), 1, bytes, 2);
+        return bus.write(kAdcAddr[a], 1, bytes, 2);
     };
     // Single-shot, AIN0, gain 1, 3300 SPS; OS=0 leaves an idle chip powered down.
     constexpr uint16_t idle = 0x43C3;  // comparator disabled
@@ -2176,7 +2247,7 @@ static void probeReadyRouting() {
     vTaskDelay(pdMS_TO_TICKS(3));
     for (int a = 0; a < 4; ++a) {
         I2C& bus = a < 2 ? i2c0 : i2c1;
-        uint8_t addr = 0x48 + (a & 1);
+        uint8_t addr = kAdcAddr[a];
         for (int rep = 0; rep < 3; ++rep) {
             uint8_t before = levels(), previous = before;
             uint32_t falling[4] = {};
@@ -2206,6 +2277,67 @@ static void probeReadyRouting() {
     }
 }
 #endif
+
+// Arranque v0.2: los ADC viven en las bandas, asi que antes de culpar al
+// firmware hay que saber quien contesta en cada bus. Niveles en reposo de
+// SDA/SCL: un 0 apunta a banda sin alimentar o cableado, no a direcciones.
+static void scanI2cBus(I2C& bus, int index, gpio_num_t sda, gpio_num_t scl) {
+    char found[160];
+    int p = 0;
+    for (uint8_t addr = 0x08; addr <= 0x77; ++addr)
+        if (bus.probe(addr) == ESP_OK && p < (int)sizeof(found) - 6)
+            p += snprintf(found + p, sizeof(found) - p, ",%02X", addr);
+    printf("#I2CSCAN:%d,SDA=%d,SCL=%d%s\n", index, gpio_get_level(sda),
+           gpio_get_level(scl), p ? found : ",NONE");
+}
+
+// Bring-up: un RDY sano esta quieto en alto mientras nadie convierte. Si
+// oscila, la banda esta mal conectada o el ALERT del ADC esta danado; sin el
+// blindaje de configureAlertPin ese ruido ocupaba el ISR de GPIO en core 0.
+static void probeReadyLines() {
+    for (int a = 0; a < 4; ++a) {
+        const int first = gpio_get_level(kRDY[a]);
+        int previous = first, edges = 0;
+        const int64_t end = esp_timer_get_time() + 20000;
+        while (esp_timer_get_time() < end) {
+            const int now = gpio_get_level(kRDY[a]);
+            edges += now != previous;
+            previous = now;
+        }
+        printf("#RDYLINE:%d,%d,%d,%d\n", a + 1, (int)kRDY[a], first, edges);
+    }
+}
+
+// Bring-up: la salida RAW de cada etapa queda en su pedestal de media escala
+// y la ENV cerca de 0 sin musculo; asi se midio el mapa kRawCh/kEnvCh en la
+// v0.1. Linea: #ADCCH:<adc>,<addr>,<c0>,<c1>,<c2>,<c3>,<mapa actual r/e>.
+static void probeAdcChannels() {
+    for (int a = 0; a < 4; ++a) {
+        if (adc[a]->checkForDevice() != ESP_OK) continue;
+        int value[4];
+        for (int c = 0; c < 4; ++c) {
+            int sum = 0;
+            for (int n = 0; n < 8; ++n) sum += adc[a]->readSingleEndedSigned(c);
+            value[c] = sum / 8;
+        }
+        char map[5];
+        for (int c = 0; c < 4; ++c) map[c] = isRawCh((uint8_t)a, (uint8_t)c) ? 'r' : 'e';
+        map[4] = '\0';
+        printf("#ADCCH:%d,%02X,%d,%d,%d,%d,%s\n", a + 1, (unsigned)kAdcAddr[a],
+               value[0], value[1], value[2], value[3], map);
+    }
+}
+
+// PSRAM_CAP != 0 means an in-package octal PSRAM (e.g. WROOM-1-N8R8), which
+// owns GPIO33..37 -- the IMU SPI pins of this board.
+static void printChipInfo() {
+    uint8_t psram = 0, flash = 0, pkg = 0;
+    esp_efuse_read_field_blob(ESP_EFUSE_PSRAM_CAP, &psram, 2);
+    esp_efuse_read_field_blob(ESP_EFUSE_FLASH_CAP, &flash, 3);
+    esp_efuse_read_field_blob(ESP_EFUSE_PKG_VERSION, &pkg, 3);
+    printf("#CHIP:PSRAM_CAP=%u,FLASH_CAP=%u,PKG=%u\n",
+           (unsigned)psram, (unsigned)flash, (unsigned)pkg);
+}
 
 extern "C" void app_main() {
 
@@ -2253,12 +2385,13 @@ extern "C" void app_main() {
     /* ---- I2C ------------------------------------------------------------- */
     i2c0.init();
     i2c1.init();
+    printChipInfo();
+    scanI2cBus(i2c0, 0, kSDA0, kSCL0);
+    scanI2cBus(i2c1, 1, kSDA1, kSCL1);
 
     /* ---- ADCs ------------------------------------------------------------ */
-    adc[0] = new ADS1015(i2c0, ADS1015::ADS111X_ADDR_GND);
-    adc[1] = new ADS1015(i2c0, ADS1015::ADS111X_ADDR_VCC);
-    adc[2] = new ADS1015(i2c1, ADS1015::ADS111X_ADDR_GND);
-    adc[3] = new ADS1015(i2c1, ADS1015::ADS111X_ADDR_VCC);
+    for (int i = 0; i < 4; ++i)
+        adc[i] = new ADS1015(i < 2 ? i2c0 : i2c1, kAdcAddr[i]);
 
     adcOK = true;
     for (int i = 0; i < 4; i++)
@@ -2293,6 +2426,8 @@ extern "C" void app_main() {
     probeBusClock(i2c0, kSCL0, 0);
     probeBusClock(i2c1, kSCL1, 1);
 #endif
+    probeReadyLines();
+    probeAdcChannels();
 #if defined(EMG8_ADC_TIMING) || defined(EMG8_NET_DIAGNOSTICS)
     probeReadyRouting();
 #endif
@@ -2300,7 +2435,7 @@ extern "C" void app_main() {
     /* ---- SD card: recovery is also available after an absent-at-boot card. */
     if (!sdRecover() && sdFault.load(std::memory_order_relaxed) == SdFault::None)
         sdFault.store(SdFault::Init, std::memory_order_relaxed);
-    /* ---- IMU (ICM-42605 over SPI3) --------------------------------------- */
+    /* ---- IMUs (ICM-42605 over SPI3): on-board + IMU1..IMU4 --------------- */
     esp_log_level_set("ICM42605", ESP_LOG_DEBUG);
     // Cinco IMU comparten MOSI/SCK/MISO. El driver SPI solo maneja el CS de
     // los dispositivos que ya registro; uno sin registrar quedaria flotando y
@@ -2308,12 +2443,10 @@ extern "C" void app_main() {
     // en alto antes del primer flanco de reloj.
     {
         gpio_config_t cs = {};
-        cs.pin_bit_mask = 1ULL << kIMU_CS;
-        for (gpio_num_t pin : kExtImuCs) cs.pin_bit_mask |= 1ULL << pin;
+        for (gpio_num_t pin : kImuCs) cs.pin_bit_mask |= 1ULL << pin;
         cs.mode = GPIO_MODE_OUTPUT;
         // Nivel antes de habilitar la salida: evita un pulso bajo de CS.
-        gpio_set_level(kIMU_CS, 1);
-        for (gpio_num_t pin : kExtImuCs) gpio_set_level(pin, 1);
+        for (gpio_num_t pin : kImuCs) gpio_set_level(pin, 1);
         ESP_ERROR_CHECK(gpio_config(&cs));
     }
     spiIMU = new SPI(SPI::SpiMode::kMaster, SPI3_HOST, kIMU_MOSI, kIMU_MISO, kIMU_SCK);
@@ -2321,20 +2454,28 @@ extern "C" void app_main() {
     if (imuSpiErr != ESP_OK) {
         printf("IMU SPI bus init failed: %s\n", esp_err_to_name(imuSpiErr));
     } else {
-        printf("IMU SPI bus OK (MOSI=%d MISO=%d SCK=%d CS=%d)\n",
-               kIMU_MOSI, kIMU_MISO, kIMU_SCK, kIMU_CS);
-        imu = new ICM42605(*spiIMU, kIMU_CS, 1000000);  // 1 MHz
+        printf("IMU SPI bus OK (MOSI=%d MISO=%d SCK=%d)\n",
+               kIMU_MOSI, kIMU_MISO, kIMU_SCK);
         vTaskDelay(pdMS_TO_TICKS(50));  // Let SPI bus + IMU settle before init
-        esp_err_t imuErr = imu->init(ICM42605::AccelScale::kAFS_4G,
-                       ICM42605::GyroScale::kGFS_500DPS,
-                       ICM42605::AccelODR::kAODR_200Hz,
-                       ICM42605::GyroODR::kGODR_200Hz);
-        if (imuErr == ESP_OK) {
-            imuOK = true;
-            printf("IMU OK (ICM-42605 SPI)\n");
-        } else {
-            printf("IMU init failed: %s (0x%x)\n", esp_err_to_name(imuErr), imuErr);
+        spi_device_handle_t imuShared = nullptr;
+        esp_err_t devErr = spiIMU->addDevice(GPIO_NUM_NC, kIMU_SPI_HZ,
+                                             SPI::ClockMode::kMode3, &imuShared);
+        if (devErr != ESP_OK)
+            printf("#ERR:IMU_SPI_DEVICE:%s\n", esp_err_to_name(devErr));
+        // Una IMU externa ausente (banda sin conectar) solo queda fuera del
+        // mapa: no bloquea el arranque ni la grabacion de sEMG.
+        for (int i = 0; devErr == ESP_OK && i < kNUM_IMUS; ++i) {
+            imuDev[i] = new ICM42605(*spiIMU, kImuCs[i], imuShared);
+            esp_err_t imuErr = imuDev[i]->init(ICM42605::AccelScale::kAFS_4G,
+                           ICM42605::GyroScale::kGFS_500DPS,
+                           ICM42605::AccelODR::kAODR_200Hz,
+                           ICM42605::GyroODR::kGODR_200Hz);
+            if (imuErr == ESP_OK) imuMask |= 1U << i;
+            printf("#IMU:%d,CS=%d,%s,%s\n", i, (int)kImuCs[i],
+                   imuErr == ESP_OK ? "OK" : "FAIL", esp_err_to_name(imuErr));
         }
+        imuOK = imuMask & 1U;
+        printf("#IMUS:MASK=0x%02X\n", (unsigned)imuMask);
     }
 
     /* ---- Battery manager (5V charging board) ------------------------------ */
@@ -2389,12 +2530,19 @@ extern "C" void app_main() {
     uint8_t rxByte;
     uint32_t lastLedMs = 0;
 
+    uint32_t lastIdleBeatMs = 0;
     while (mode == Mode::Idle) {
         serviceRecordingSafety();
         uint32_t nowMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
         if (nowMs - lastLedMs >= 100) {
             lastLedMs = nowMs;
             updateStatusLed();
+        }
+        // Bring-up v0.2: latido en reposo para distinguir "bucle colgado" de
+        // "no llega el RX". Quitar cuando las bandas esten validadas.
+        if (nowMs - lastIdleBeatMs >= 5000) {
+            lastIdleBeatMs = nowMs;
+            printf("#IDLE:%lu\n", (unsigned long)nowMs);
         }
         // Check UART. Timeout kept short (was 50ms) so this loop -- and the
         // button check below it -- run often enough to catch a fast
@@ -2468,7 +2616,7 @@ extern "C" void app_main() {
     if (xTaskCreatePinnedToCore(adcBusTask,   "adc1", 4096, (void*)1, configMAX_PRIORITIES - 2, nullptr, 1) != pdPASS)
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
 #ifndef EMG8_NO_IMU_TASK
-    if (imuOK)
+    if (imuMask)
         xTaskCreatePinnedToCore(imuTask,  "imu",  4096, nullptr, 4, nullptr, 1);
 #else
     // Compilar con -D EMG8_NO_IMU_TASK deja el IMU inicializado pero sin

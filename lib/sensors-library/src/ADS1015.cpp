@@ -362,6 +362,10 @@ esp_err_t ADS1015::configureAlertPin(gpio_num_t alertPin, bool activeLow) {
     io_conf.intr_type = activeLow ? GPIO_INTR_NEGEDGE : GPIO_INTR_POSEDGE;
     err = gpio_config(&io_conf);
     if (err != ESP_OK) return err;
+    // Edge type stays configured, but the interrupt is only enabled once a
+    // start path registers alertISR. A noisy or miswired ALERT line must not
+    // keep the shared GPIO ISR busy while no acquisition is running.
+    gpio_intr_disable(alertPin);
 
     return ESP_OK;
 }
@@ -478,6 +482,7 @@ esp_err_t ADS1015::startContinuous(const uint8_t* channels, uint8_t numChannels,
     gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     esp_err_t err = gpio_isr_handler_add(alertPin_, alertISR, this);
     if (err != ESP_OK) return err;
+    gpio_intr_enable(alertPin_);  // disabled while idle, see configureAlertPin
 
     // Mark running before starting the task
     continuousRunning_ = true;
@@ -493,6 +498,7 @@ esp_err_t ADS1015::startContinuous(const uint8_t* channels, uint8_t numChannels,
     );
     if (ret != pdPASS) {
         continuousRunning_ = false;
+        gpio_intr_disable(alertPin_);
         gpio_isr_handler_remove(alertPin_);
         return ESP_ERR_NO_MEM;
     }
@@ -520,6 +526,7 @@ esp_err_t ADS1015::stopContinuous() {
 
     // Remove the ISR handler
     if (alertPin_ != GPIO_NUM_NC) {
+        gpio_intr_disable(alertPin_);
         gpio_isr_handler_remove(alertPin_);
     }
 
@@ -707,6 +714,7 @@ esp_err_t ADS1015::startMixedContinuous(const ChannelConfig* configs, uint8_t nu
     gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     esp_err_t err = gpio_isr_handler_add(alertPin_, alertISR, this);
     if (err != ESP_OK) return err;
+    gpio_intr_enable(alertPin_);  // disabled while idle, see configureAlertPin
 
     continuousRunning_ = true;
 
@@ -727,6 +735,7 @@ esp_err_t ADS1015::startMixedContinuous(const ChannelConfig* configs, uint8_t nu
                                 configMAX_PRIORITIES - 1, &continuousTaskHandle_, 1);
     if (ret != pdPASS) {
         continuousRunning_ = false;
+        gpio_intr_disable(alertPin_);
         gpio_isr_handler_remove(alertPin_);
         return ESP_ERR_NO_MEM;
     }
@@ -816,6 +825,7 @@ esp_err_t ADS1015::startMixedContinuousExternal(const ChannelConfig* configs,
     gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     esp_err_t err = gpio_isr_handler_add(alertPin_, alertISR, this);
     if (err != ESP_OK) return err;
+    gpio_intr_enable(alertPin_);  // disabled while idle, see configureAlertPin
 
     continuousRunning_ = true;
     continuousTaskHandle_ = nullptr;  // No internal task

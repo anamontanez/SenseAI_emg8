@@ -157,7 +157,7 @@ def verify(folder, files, capture):
                 key = (adc, ch)
                 counts[key] += 1
             else:
-                key = ('imu',)
+                key = ('imu', rec[18])  # IMU index: 0 on-board, 1-4 sensor boards
             try:
                 ts = unwrap_sample(ts, last.get(key))
             except ValueError as exc:

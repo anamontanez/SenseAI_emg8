@@ -6,6 +6,7 @@
  ******************************************************************************/
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 /** @brief One ADC conversion (also the SD R/E.bin and UDP record format). */
@@ -23,9 +24,11 @@ struct __attribute__((packed)) ImuSample {
     int16_t  ax, ay, az;
     int16_t  gx, gy, gz;
     int16_t  temp100;  // temperature × 100
-    uint16_t _pad;     // pad to 20 bytes
+    uint8_t  imu;      // 0 = on-board, 1–4 = sensor-board IMU1–IMU4 (was padding: old files read 0)
+    uint8_t  _pad;     // pad to 20 bytes
 };
 static_assert(sizeof(ImuSample) == 20, "ImuSample must be 20 bytes");
+static_assert(offsetof(ImuSample, imu) == 18, "IMU index lives in the former padding byte");
 
 /** @brief Label/phase event written to master file (see docs/companion-protocol.md). */
 struct __attribute__((packed)) LabelEvent {

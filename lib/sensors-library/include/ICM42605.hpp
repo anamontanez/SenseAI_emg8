@@ -104,6 +104,19 @@ public:
      */
     ICM42605(SPI& bus, gpio_num_t csPin, int spiClockHz = 8000000);
 
+    /**
+     * @brief Construct an ICM42605 on a shared SPI device with software CS.
+     *
+     * Several chips share one device handle registered without a hardware CS
+     * (spics_io_num = -1); this driver drives @p csPin itself around every
+     * transfer. Needed when a host has fewer CS lines than chips (SPI3 on the
+     * ESP32-S3 has three). @p csPin must already be an output held high.
+     * @param bus          Reference to an initialised SPI bus object.
+     * @param csPin        GPIO pin used for chip-select, driven in software.
+     * @param sharedDevice Device handle added with no CS pin.
+     */
+    ICM42605(SPI& bus, gpio_num_t csPin, spi_device_handle_t sharedDevice);
+
     /*----------------------------------------------------------------------*/
     /*                         Sensor interface                             */
     /*----------------------------------------------------------------------*/
@@ -264,6 +277,7 @@ private:
     gpio_num_t csPin_ = GPIO_NUM_NC;
     int spiClockHz_ = 8000000;
     mutable spi_device_handle_t spiDev_ = nullptr;
+    bool softCs_ = false;  ///< true: shared device, csPin_ driven by this driver
 
     float aRes_ = 0.0f;  ///< Accel resolution (g per LSB)
     float gRes_ = 0.0f;  ///< Gyro resolution (dps per LSB)
@@ -283,6 +297,8 @@ private:
     esp_err_t readRegister(uint8_t regAddr, uint8_t* value) const;
     esp_err_t readRegisters(uint8_t regAddr, uint8_t* data, size_t len) const;
     esp_err_t writeRegister(uint8_t regAddr, uint8_t value) const;
+    /// SPI transfer with CS handling; rx == nullptr means write-only.
+    esp_err_t spiTransfer(uint8_t* tx, uint8_t* rx, size_t len) const;
 
     static float computeAccelRes(AccelScale scale);
     static float computeGyroRes(GyroScale scale);

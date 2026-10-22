@@ -68,7 +68,7 @@ class Records:
                     continue
                 key = f'{kind}:{adc}:{ch}'
             else:
-                key = '2:imu'
+                key = f'2:imu:{pkt[offset + 18]}'  # IMU index: 0 on-board, 1-4 sensor boards
             self.timestamps[key].append(ts)
 
     def summary(self):
@@ -397,7 +397,7 @@ def run(args):
         if elapsed and values[ch]
     }
     acquired = sum(sum(v[:4]) for v in counters.values())
-    received = sum(len(v) for k, v in records.timestamps.items() if k != '2:imu')
+    received = sum(len(v) for k, v in records.timestamps.items() if not k.startswith('2:imu'))
     result['adc_delivery_fraction'] = received / acquired if acquired and args.condition in ('udp', 'quiet') else None
     result['i2c_errors'] = sum(v[4] for v in counters.values())
     result['retriggers'] = sum(v[5] for v in counters.values())

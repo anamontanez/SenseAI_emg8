@@ -16,6 +16,7 @@
 #include <cstring>
 
 #include "ICM42605.hpp"
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -32,6 +33,10 @@ ICM42605::ICM42605(I2C& bus, uint8_t address)
 
 ICM42605::ICM42605(SPI& bus, gpio_num_t csPin, int spiClockHz)
     : useSpi_(true), spi_(&bus), csPin_(csPin), spiClockHz_(spiClockHz) {
+}
+
+ICM42605::ICM42605(SPI& bus, gpio_num_t csPin, spi_device_handle_t sharedDevice)
+    : useSpi_(true), spi_(&bus), csPin_(csPin), spiDev_(sharedDevice), softCs_(true) {
 }
 
 /*=============================================================================
@@ -65,7 +70,7 @@ esp_err_t ICM42605::init(AccelScale aScale, GyroScale gScale, AccelODR aODR,
     if (useSpi_) {
         uint8_t tx[2] = { 0x75 | 0x80, 0x00 };  // WHO_AM_I reg read
         uint8_t rx[2] = {};
-        esp_err_t dbgErr = spi_->transfer(&spiDev_, tx, rx, 2);
+        esp_err_t dbgErr = spiTransfer(tx, rx, 2);
         ESP_LOGI(TAG, "Pre-reset WHO_AM_I probe: tx=[%02X %02X] rx=[%02X %02X] err=%s",
                  tx[0], tx[1], rx[0], rx[1], esp_err_to_name(dbgErr));
     }
@@ -293,7 +298,7 @@ esp_err_t ICM42605::readRegister(uint8_t regAddr, uint8_t* value) const {
     if (useSpi_) {
         uint8_t tx[2] = { static_cast<uint8_t>(regAddr | 0x80), 0x00 };
         uint8_t rx[2] = {};
-        esp_err_t err = spi_->transfer(&spiDev_, tx, rx, 2);
+        esp_err_t err = spiTransfer(tx, rx, 2);
         *value = rx[1];
         return err;
     }
@@ -307,7 +312,7 @@ esp_err_t ICM42605::readRegisters(uint8_t regAddr, uint8_t* data, size_t len) co
         uint8_t rx[16] = {};
         if (len > 15) len = 15;
         tx[0] = regAddr | 0x80;  // read bit
-        esp_err_t err = spi_->transfer(&spiDev_, tx, rx, 1 + len);
+        esp_err_t err = spiTransfer(tx, rx, 1 + len);
         memcpy(data, rx + 1, len);
         return err;
     }
@@ -317,9 +322,19 @@ esp_err_t ICM42605::readRegisters(uint8_t regAddr, uint8_t* data, size_t len) co
 esp_err_t ICM42605::writeRegister(uint8_t regAddr, uint8_t value) const {
     if (useSpi_) {
         uint8_t tx[2] = { static_cast<uint8_t>(regAddr & 0x7F), value };
-        return spi_->write(&spiDev_, tx, 2);
+        return spiTransfer(tx, nullptr, 2);
     }
     return i2c_->write(address_, regAddr, &value, 1);
+}
+
+esp_err_t ICM42605::spiTransfer(uint8_t* tx, uint8_t* rx, size_t len) const {
+    // Con CS por software, el CS rodea toda la transaccion; el bus lo adquiere
+    // el wrapper SPI dentro de transfer/write.
+    if (softCs_) gpio_set_level(csPin_, 0);
+    esp_err_t err = rx ? spi_->transfer(&spiDev_, tx, rx, len)
+                       : spi_->write(&spiDev_, tx, len);
+    if (softCs_) gpio_set_level(csPin_, 1);
+    return err;
 }
 
 float ICM42605::computeAccelRes(AccelScale scale) {

@@ -1,5 +1,6 @@
 """Compile the actual UDP task against a deterministic storage-pressure probe."""
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -89,33 +90,36 @@ static_assert(result==0, "Network priority regression; result identifies CHECK l
         source=(root/'src/main.cpp').read_text(encoding='utf-8')
         body=source.split('static NetStoragePressure storagePressure() {',1)[1].split('static void resetDropCounters',1)[0]
         body='constexpr NetStoragePressure storagePressure() {'+body
+        # Use the firmware's real queue length so the thresholds track it.
+        qlen=int(re.search(r'kRAW_QLEN\s*=\s*(\d+);',source).group(1))
+        throttle,defer=qlen//4,3*qlen//4
         harness=r"""
 using UBaseType_t=unsigned;
 enum class NetStoragePressure { None, Throttle, Defer };
 struct Harness {
     bool sdOK=false;
     int rawQ=1;
-    UBaseType_t pending=12000;
-    static constexpr unsigned kRAW_QLEN=12000;
+    UBaseType_t pending=@QLEN@;
+    static constexpr unsigned kRAW_QLEN=@QLEN@;
     constexpr UBaseType_t uxQueueMessagesWaiting(int) { return pending; }
-"""
+""".replace('@QLEN@',str(qlen))
         checks=r"""
     constexpr bool run() {
         if (storagePressure()!=NetStoragePressure::None) return false;
         sdOK=true; rawQ=0;
         if (storagePressure()!=NetStoragePressure::None) return false;
-        rawQ=1; pending=2999;
+        rawQ=1; pending=@THROTTLE@-1;
         if (storagePressure()!=NetStoragePressure::None) return false;
-        pending=3000;
+        pending=@THROTTLE@;
         if (storagePressure()!=NetStoragePressure::Throttle) return false;
-        pending=8999;
+        pending=@DEFER@-1;
         if (storagePressure()!=NetStoragePressure::Throttle) return false;
-        pending=9000;
+        pending=@DEFER@;
         if (storagePressure()!=NetStoragePressure::Defer) return false;
-        pending=12000;
+        pending=@QLEN@;
         return storagePressure()==NetStoragePressure::Defer;
     }
-};
+};""".replace('@THROTTLE@',str(throttle)).replace('@DEFER@',str(defer)).replace('@QLEN@',str(qlen))+r"""
 static_assert([]{ Harness h; return h.run(); }(), "SD pressure thresholds");
 """
         compiler=shutil.which('clang++')

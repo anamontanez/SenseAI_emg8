@@ -30,18 +30,24 @@ v0.2 has no reed switch; the button starts (short press) and stops (3 s hold).
 | I2C0 | GPIO4 | GPIO5 | ADC1 (0x48), ADC2 (0x49) |
 | I2C1 | GPIO2 | GPIO48 | ADC3 (0x48), ADC4 (0x49) |
 
-The 0x48/0x49 addresses are carried over from v0.1 (odd ADC with ADDR to GND,
-even ADC with ADDR to VCC). An ADC reported as missing at boot should first be
-checked for its ADDR strap on the sensor board.
+Per the band schematic, U5 (ADDR to GND, 0x48) digitizes sensors S1/S2 and
+U6 (ADDR to 3V3, 0x49) S3/S4. Boot prints `#I2CSCAN:<bus>,SDA=..,SCL=..,<addresses>`
+for both buses and `#ADCCH:<adc>,<addr>,<c0..c3>,<map>` with one averaged
+single-shot value per channel (RAW outputs sit at the mid-scale pedestal,
+ENV near 0 without muscle activity).
 
 ### ADC ALERT/RDY Interrupts
 
-| ADC | GPIO |
-|-----|------|
-| ADC1 | GPIO6 |
-| ADC2 | GPIO7 |
-| ADC3 | GPIO9 |
-| ADC4 | GPIO15 |
+| ADC | GPIO | Controller silkscreen |
+|-----|------|-----------------------|
+| ADC1 (U5, RDY1) | GPIO7 | ADC2_RDY |
+| ADC2 (U6, RDY2) | GPIO6 | ADC1_RDY |
+| ADC3 (U5, RDY1) | GPIO15 | ADC4_RDY |
+| ADC4 (U6, RDY2) | GPIO9 | ADC3_RDY |
+
+Measured with `#RDYPROBE` on 2026-10-22: the band's RDY1/RDY2 nets reach the
+controller pins labelled for the other ADC. The firmware follows the measured
+routing; the label/route swap is flagged for the hardware review.
 
 The default storage-bench build triggers each ADC once at boot and prints
 `#RDYPROBE` lines showing which ready input actually fell, so the routing is
@@ -271,8 +277,10 @@ After a long interruption the limiter discards accumulated catch-up credit.
 The 32-byte v4 master header uses previously reserved byte 25 for the rate:
 0 = max (including historical files), 1 = 1000 cap. Byte 26 is metadata extension
 2 (phase/label events plus clock-wrap anchors); byte 27 = 1 advertises the anchors.
-Bytes 28-31 remain reserved. Historical metadata extensions 0/1 remain readable.
-UDP and sample record layouts are unchanged.
+Byte 28 is the IMU presence mask (bit *i* = IMU index *i* initialized at boot;
+0 in historical files). Bytes 29-31 remain reserved. Historical metadata
+extensions 0/1 remain readable. Record sizes are unchanged; the former IMU
+padding byte 18 now carries the IMU index.
 
 ### Bracelet → Host Responses
 
@@ -281,7 +289,9 @@ UDP and sample record layouts are unchanged.
 | `#READY` | Firmware booted and is ready for commands |
 | `#BOOT:reset=...,heap=...,minheap=...` | Reset cause and heap watermarks from the preceding boot |
 | `#MAC:<hex>` | Device MAC used in session directory names |
-| `#INIT:ADC=...,SD=...,IMU=...` | Peripheral init summary |
+| `#INIT:ADC=...,SD=...,IMU=...` | Peripheral init summary (IMU = on-board IMU) |
+| `#IMU:<idx>,CS=<gpio>,OK\|FAIL,<err>` | Boot result for each IMU index (0 on-board, 1–4 sensor boards) |
+| `#IMUS:MASK=<hex>[,COUNT=<c0>/…/<c4>,ERRORS=<e0>/…/<e4>]` | IMU presence mask at boot; with per-IMU sample/read-error counts in status and after `#CNT` at stop |
 | `#MODE:<n>` | Current acquisition mode |
 | `#CD:<n>` | Countdown tick before recording starts |
 | `#CDCFG:<n>` | Configured countdown duration in seconds |
@@ -320,7 +330,7 @@ Field meanings:
 | `mode` | `0=Idle`, `1=All`, `2=Raw`, `3=Env`, `4=Sensor test` |
 | `recording` | `0` stopped/paused, `1` recording |
 | `sd_ok` | `1` if SD storage is available |
-| `imu_ok` | `1` if the IMU initialized correctly |
+| `imu_ok` | `1` if the on-board IMU initialized correctly (sensor-board IMUs: see `#IMUS`) |
 | `battery_mV` | Battery voltage in millivolts |
 | `battery_pct` | Battery estimate in percent |
 | `raw_drops` | Number of dropped raw EMG samples in the current run |
@@ -426,7 +436,7 @@ repeatedly triggered brownout resets on the tested auxiliary-board 3.3 V rail;
 
 - The bracelet hosts a WPA2 SoftAP: SSID `EMG8-<MAC>`, password `emg8sense`, bracelet IP `192.168.4.1`.
 - Subscribe by sending **any** UDP datagram to `192.168.4.1:3333`; the firmware streams to the sender's address/port from then on. Re-send periodically if your viewer's port may change.
-- The stream carries **everything at full rate** (raw + envelope + IMU; ~71 KB/s of record payload at 1000 Hz/raw in All mode). SD recording reliability requires separate validation with a working card.
+- The stream carries **everything at full rate** (raw + envelope + all IMUs; ~87 KB/s of record payload at 1000 Hz/raw in All mode with five IMUs). SD recording reliability requires separate validation with a working card.
 
 **Packet format** (little-endian, ≤1404 bytes):
 
@@ -481,7 +491,8 @@ Each recording start within a session directory `s_<MAC>_<epoch>/` produces one 
 | 25 | 1 | Rate selection: 0=max, 1=1000 Hz average cap |
 | 26 | 1 | Metadata extension: 0=historical labels, 1=phase/event kind, 2=adds wrap anchors |
 | 27 | 1 | Wrap-anchor convention: 1 for metadata extension 2 |
-| 28 | 4 | Reserved |
+| 28 | 1 | IMU presence mask (bit 0 on-board, bits 1–4 IMU1–IMU4) |
+| 29 | 3 | Reserved |
 
 Metadata event (12 bytes, recording-start snapshot and each label/phase command received while recording):
 
@@ -518,7 +529,12 @@ decoder. Historical readers must recognize metadata extension 2 or reject it.
 | 4 | 2×3 | Accel X/Y/Z, milli-g (int16) |
 | 10 | 2×3 | Gyro X/Y/Z, deci-dps (int16) |
 | 16 | 2 | Temperature × 100 (int16) |
-| 18 | 2 | Reserved |
+| 18 | 1 | IMU index: 0 = on-board, 1–4 = sensor-board IMU1–IMU4 |
+| 19 | 1 | Reserved |
+
+All present IMUs share `I<nnn>.bin`, interleaved in read order; split the
+records by byte 18 and unwrap timestamps per IMU index. Files recorded before
+v0.2 hold 0 there, which reads as the on-board IMU.
 
 These layouts are defined in [src/emg8_types.hpp](src/emg8_types.hpp) (`Sample`, `ImuSample`, `LabelEvent`) — the same structs are used for the UDP stream records (see above).
 
