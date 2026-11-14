@@ -2328,6 +2328,71 @@ static void probeAdcChannels() {
     }
 }
 
+// Con CS por software, el driver SPI aplica el CPOL de un dispositivo recien al
+// empezar su transaccion, o sea con el CS ya en bajo. Tras iniciar el bus SCK
+// reposa en bajo, asi que la primera transaccion en modo 3 sube SCK con una IMU
+// elegida: un flanco de mas. Sospecha: es el unico 0x00 de 1000 que leyo la IMU
+// de placa en la primera pasada de boot17/boot18; la linea base de #IMUCHK lo
+// confirma si queda en 1000. Una transaccion con todos los CS en alto deja SCK
+// en el reposo del modo de @p dev antes de elegir a nadie.
+static void settleSckIdle(spi_device_handle_t dev) {
+    uint8_t tx = 0, rx = 0;
+    spiIMU->transfer(&dev, &tx, &rx, 1);
+}
+
+#if defined(EMG8_ADC_TIMING) || defined(EMG8_NET_DIAGNOSTICS)
+// Bring-up v0.2: con las dos bandas, IMU1/IMU3 leen WHO_AM_I 0x44 en vez de
+// 0x42, 1000 de 1000. Barridos anteriores (boot17, boot18, modo 3): igual a
+// 1 MHz que a 500 kHz, ninguna fuerza de salida 1-3 lo arregla, y SCK con la
+// fuerza minima lleva a 0x44 a las cinco IMU; MOSI y CS no influyen. Este
+// barrido descarta lo que queda por firmware: modo 0 (SCK reposa en bajo) y
+// relojes de 100-250 kHz, mas la firma de SCK debil en cada modo.
+// 1000 lecturas por IMU y pasada, antes de init(), con fuerza de fabrica salvo
+// donde se indica. Cada pasada usa un dispositivo propio y lo libera: SPI3
+// admite tres.
+// Linea: #IMUCHK:<modo>,<kHz>,<cap SCK>,<imu>,<ok>,<mal>,<ultimo malo>.
+static void probeImuSpi(spi_device_handle_t shared) {
+    constexpr int kReads = 1000;
+    constexpr int8_t O = -1;  // fuerza original de SCK
+    struct Pass { uint8_t mode; int khz; int8_t sckCap; };
+    static constexpr Pass kPasses[] = {
+        {3, 1000, O}, {3, 250, O}, {3, 100, O},              // modo actual
+        {0, 1000, O}, {0, 500, O}, {0, 250, O}, {0, 100, O},  // modo 0
+        {3, 1000, 0}, {0, 1000, 0},  // SCK debil: la firma depende del modo?
+    };
+    gpio_drive_cap_t sckOriginal;
+    gpio_get_drive_capability(kIMU_SCK, &sckOriginal);
+    for (const Pass& pass : kPasses) {
+        spi_device_handle_t dev = nullptr;
+        const SPI::ClockMode mode = pass.mode ? SPI::ClockMode::kMode3 : SPI::ClockMode::kMode0;
+        if (spiIMU->addDevice(GPIO_NUM_NC, pass.khz * 1000, mode, &dev) != ESP_OK) {
+            printf("#IMUCHK:ERROR,%d,%d\n", pass.mode, pass.khz);
+            continue;
+        }
+        const gpio_drive_cap_t cap =
+            pass.sckCap == O ? sckOriginal : (gpio_drive_cap_t)pass.sckCap;
+        gpio_set_drive_capability(kIMU_SCK, cap);
+        settleSckIdle(dev);  // cambiar de modo mueve el reposo de SCK
+        for (int i = 0; i < kNUM_IMUS; ++i) {
+            ICM42605 probe(*spiIMU, kImuCs[i], dev);
+            int ok = 0, bad = 0;
+            uint8_t lastBad = 0;
+            for (int n = 0; n < kReads; ++n) {
+                uint8_t who = 0;
+                if (probe.readWhoAmI(&who) == ESP_OK && who == probe.getID()) ++ok;
+                else { ++bad; lastBad = who; }
+            }
+            printf("#IMUCHK:%d,%d,%d,%d,%d,%d,%02X\n", pass.mode, pass.khz, (int)cap, i,
+                   ok, bad, (unsigned)lastBad);
+            vTaskDelay(1);  // a 100 kHz cada bloque ronda 0,2 s: dejar correr IDLE0
+        }
+        spiIMU->removeDevice(&dev);
+    }
+    gpio_set_drive_capability(kIMU_SCK, sckOriginal);
+    settleSckIdle(shared);  // init() y la adquisicion usan el modo 3 compartido
+}
+#endif
+
 // PSRAM_CAP != 0 means an in-package octal PSRAM (e.g. WROOM-1-N8R8), which
 // owns GPIO33..37 -- the IMU SPI pins of this board.
 static void printChipInfo() {
@@ -2462,6 +2527,11 @@ extern "C" void app_main() {
                                              SPI::ClockMode::kMode3, &imuShared);
         if (devErr != ESP_OK)
             printf("#ERR:IMU_SPI_DEVICE:%s\n", esp_err_to_name(devErr));
+        else
+            settleSckIdle(imuShared);
+#if defined(EMG8_ADC_TIMING) || defined(EMG8_NET_DIAGNOSTICS)
+        if (devErr == ESP_OK) probeImuSpi(imuShared);
+#endif
         // Una IMU externa ausente (banda sin conectar) solo queda fuera del
         // mapa: no bloquea el arranque ni la grabacion de sEMG.
         for (int i = 0; devErr == ESP_OK && i < kNUM_IMUS; ++i) {

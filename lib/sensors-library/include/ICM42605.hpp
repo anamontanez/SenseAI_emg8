@@ -190,6 +190,16 @@ public:
      */
     esp_err_t getIntStatus(uint8_t* status) const;
 
+    /**
+     * @brief Reads WHO_AM_I with no reset or configuration (bus diagnostics).
+     *
+     * Repeated reads expose bit errors on a marginal bus: a healthy part
+     * always returns getID() (0x42).
+     * @param value Pointer to store the byte read.
+     * @return esp_err_t ESP_OK if the transfer completed.
+     */
+    esp_err_t readWhoAmI(uint8_t* value) const;
+
     /*----------------------------------------------------------------------*/
     /*                         Getters                                      */
     /*----------------------------------------------------------------------*/

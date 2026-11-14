@@ -254,6 +254,10 @@ esp_err_t ICM42605::getIntStatus(uint8_t* status) const {
     return readRegister(Reg::kIntStatus, status);
 }
 
+esp_err_t ICM42605::readWhoAmI(uint8_t* value) const {
+    return readRegister(Reg::kWhoAmI, value);
+}
+
 /*=============================================================================
  *  Getters
  *===========================================================================*/

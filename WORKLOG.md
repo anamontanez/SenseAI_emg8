@@ -2173,3 +2173,88 @@ flashed); board runs `.dist/archivo/2026-10-22_..._diag2` (ELF 8101118f...).
 **Pendiente:** flashing without BOOT (DTR/RTS behaviour), load the new build,
 raw/env channel map via #ADCCH, SCK drive strength / 500 kHz test, rate validation.
 **Sin commitear:** see v2-firmware-improvements.md section 1.
+
+## 2026-10-22 — Flashing works with PIO; #IMUCHK drive-strength sweep (afternoon)
+**Hecho:** the user committed the morning state as 6a22316 "fault testing".
+Flashing is not a blocker: `pio run -e esp32-s3-storage-bench -t upload`
+(default_reset/hard_reset over DTR/RTS) flashed twice with no hand on the
+board, and esptool read_flash with the same reset read the app partition. That
+readback matched `.dist/archivo/2026-10-20_..._diag1.bin` byte for byte, so the
+board was running diag1, not diag2 as the morning entry says.
+`tools/capture_boot.py --reset` now resets the app over RTS like esptool's
+hard_reset. Added a boot sweep `#IMUCHK:<cap SCK><cap MOSI><cap CS>,<imu>,<ok>,<bad>,<last bad>`
+(1000 WHO_AM_I reads per IMU and pass, before init; bench envs only) and a
+public `ICM42605::readWhoAmI()`. Results with both bands (boot17, boot18):
+IMU1/IMU3 read 0x44 in 1000/1000 reads at every drive cap 1-3, at 1 MHz and
+500 kHz; IMU0/2/4 read 0x42 (one 0x00 in 1000 for IMU0 at factory drive). With SCK alone at
+GPIO_DRIVE_CAP_0 all five read 0x44, the on-board IMU included; MOSI or CS at
+CAP_0 change nothing. So clock does not matter, SCK is the sensitive line, and
+the morning's planned fix (CAP_0 / 500 kHz) is ruled out. The post-boot hang
+(§3.4) did not reproduce in three boots (boot16 without the RDY guard, boot17,
+boot18): '?' answered at 12 s and 30 s, #IDLE every 5 s, #RDYLINE high with 0
+edges. Caveats: SD failed to init (ESP_ERR_TIMEOUT) in all three; ADC3 failed
+an I2C write in boot17 and was missing from I2C1 in boot18 with RDY3 low;
+#ADCCH reads 0-18 counts on every channel (no ~600 raw pedestal), so the
+raw/env map is still unknown. Host suite 50 OK; build RAM 74,144 B, flash 944,758 B.
+**Artefactos:** `.dist/emg8-v02-storage-bench.bin` SHA256 9c9b51c5...2a3e
+(flashed, esptool hash verified; per-group drive sweep);
+`.dist/archivo/2026-10-22_emg8-v02-storage-bench_imuchk1.{bin,elf}` (671de547...a75d,
+first #IMUCHK) and `..._diag3.{bin,elf}` (4b71ef11...e676, the morning build,
+never flashed on its own). Boot logs in benchmarks/v02-bringup-2026-10-20/:
+boot16-user-flash-6a22316.log (the board as found: diag1), boot17-imuchk.log,
+boot18-imuchk-drive-sweep.log.
+**Pendiente:** right band U5 module (ADC3 dropout; same module as IMU3):
+reseat and check power. Analog stage power before the #ADCCH channel map. SD
+card, then repeat the hang check with SD READY. IMU1/IMU3: scope SCK and the
+module GND offset; series 22-47 ohm on SCK at the ESP32 and GND next to SCK in
+the next revision; firmware long shots: SPI mode 0, 100-250 kHz.
+**Sin commitear:** src/main.cpp, lib/sensors-library/include/ICM42605.hpp,
+lib/sensors-library/src/ICM42605.cpp, tools/capture_boot.py,
+v2-firmware-improvements.md, WORKLOG.md.
+
+## 2026-10-22 — #IMUCHK mode 0 / 100-250 kHz build; auto-reset failing again
+**Hecho:** `probeImuSpi` now sweeps SPI mode 3 at 1000/250/100 kHz, mode 0 at
+1000/500/250/100 kHz, and SCK at CAP_0 in each mode; each pass uses its own
+SPI3 device and frees it. Line: `#IMUCHK:<mode>,<kHz>,<cap SCK>,<imu>,<ok>,<bad>,<last bad>`.
+New `settleSckIdle()`: one transfer with every IMU CS high after adding a
+device, so SCK reaches the device's CPOL idle level before any IMU is selected
+(with software CS the driver applies CPOL only when a transaction starts, after
+CS is low). Also called in the normal path after the shared device is added.
+Suspected to be the single 0x00 in 1000 on IMU0 in the first pass of
+boot17/boot18; not confirmed yet. Build OK: RAM 74,144 B, flash 944,914 B.
+Flashing then failed twice in a row (`Failed to connect to ESP32-S3: No serial
+data received`), and the RTS reset in capture_boot.py did not restart the app
+either (#IDLE at ~2,855 s uptime), while UART both ways still works ('?'
+answered). Auto-reset worked 3 times earlier this afternoon, so it is
+intermittent: likely the CP2102 ribbon's DTR/RTS or the auto-reset circuit.
+This corrects the earlier entry's "flashing is not a blocker".
+**Artefactos:** `.dist/emg8-v02-storage-bench.bin` SHA256 7e98856c...8995 —
+NOT flashed. The board still runs
+`.dist/archivo/2026-10-22_emg8-v02-storage-bench_imuchk2-drive.bin` (9c9b51c5...2a3e).
+benchmarks/v02-bringup-2026-10-20/boot19-noreset-old-app.log holds only the
+old app's idle output (no reset happened).
+**Pendiente:** check DTR/RTS on the ribbon, flash 7e98856c, capture boot19 again.
+**Sin commitear:** src/main.cpp, lib/sensors-library/include/ICM42605.hpp,
+lib/sensors-library/src/ICM42605.cpp, tools/capture_boot.py,
+v2-firmware-improvements.md, WORKLOG.md.
+
+## 2026-10-22 — Board silent on COM4 after the ribbon reseat
+**Hecho:** after the user reseated the CP2102 ribbon and power-cycled the
+board, PIO upload failed twice more ("No serial data received", one of them
+after a manual Reset). Since then the PC receives **0 bytes** from the board: a
+300 s capture after an RTS pulse, a 300 s listen at 115200 for a manual Reset
+(no ROM banner), and two passive 15 s listens at 460800 (no #IDLE), the last
+one after the user unplugged and replugged the adapter. COM4 (CP2102) still
+enumerates OK. The user reports the LED steady red (the app's ADC-fault
+colour) after Reset; the WS2812 latches its last colour, so this alone does not
+prove the app restarted. Before the reseat, UART worked both ways and only the
+reset path failed.
+**Artefactos:** none new. `.dist/emg8-v02-storage-bench.bin` 7e98856c...8995
+still NOT flashed; board last confirmed running `..._imuchk2-drive` (9c9b51c5...).
+**Pendiente:** isolate adapter vs. board: CP2102 TX-RX loopback with the ribbon
+off; ribbon pin alignment and continuity of GPIO43 (TX0) -> CP2102 RXD and of
+GND; whether the board is powered from the adapter. Then flash and capture
+the mode/clock sweep.
+**Sin commitear:** src/main.cpp, lib/sensors-library/include/ICM42605.hpp,
+lib/sensors-library/src/ICM42605.cpp, tools/capture_boot.py,
+v2-firmware-improvements.md, WORKLOG.md.

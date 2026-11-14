@@ -1,17 +1,18 @@
-# EMG8 — firmware para la placa v0.2 (estado al 2026-10-22)
+# EMG8 — firmware para la placa v0.2 (estado al 2026-10-22, tarde)
 
 Documento de traspaso para seguir iterando desde Claude Code. Resume qué se
 hizo, qué se midió en hardware y qué queda abierto. Rama: `hardware-v2`.
+La sesión de la tarde (§3.3 `#IMUCHK`, §3.5, §4) corrige varias conclusiones
+de la mañana; donde chocan, vale lo de la tarde.
 
 ## 1. Estado del repositorio
 
 | | |
 |---|---|
-| Último commit | `4dea0cc` *Remap firmware pins to the v0.2 controller board* |
-| Sin commitear | `src/main.cpp`, `src/emg8_types.hpp`, `lib/sensors-library/{include/ICM42605.hpp, src/ICM42605.cpp, src/ADS1015.cpp}`, `README.md`, `WORKLOG.md`, `.gitignore`, `tools/{bench_sd.py, bench_acquisition.py, test_network_priority.py}` |
-| Nuevos sin commitear | `tools/test_imu_scheduling.py`, `tools/flash_noboot.py`, `tools/capture_boot.py`, `test/test_main.cpp` (firmware de prueba del colega, *Prueba_Boards*), este archivo |
+| Último commit | `6a22316` *fault testing* (2026-10-22 16:43): trae todo lo que la versión anterior de este documento listaba como sin commitear (fase 2, correcciones de bring-up, herramientas, `test/test_main.cpp`) |
+| Sin commitear | `src/main.cpp` (barrido `#IMUCHK`), `lib/sensors-library/{include/ICM42605.hpp, src/ICM42605.cpp}` (`readWhoAmI()` público), `tools/capture_boot.py` (`--reset`), este archivo, `WORKLOG.md` |
 | Tests de host | `python -B -m unittest discover -s tools -p "test_*.py"` → 50 OK |
-| Build | `pio run -e esp32-s3-storage-bench` → OK, RAM 74 144 B, flash 943 590 B |
+| Build | `pio run -e esp32-s3-storage-bench` → OK, RAM 74 144 B, flash 944 758 B |
 
 `storage-bench` es el firmware completo (SD real, I2C combinado, UDP y
 diagnósticos de arranque). Es el entorno por defecto.
@@ -20,8 +21,11 @@ Artefactos en `.dist/` (ignorado por git):
 
 | Archivo | Qué es |
 |---|---|
-| `emg8-v02-storage-bench.bin` (SHA256 `4b71ef11…e676`) | **Build más reciente, aún NO cargada en la placa** |
-| `archivo/2026-10-22_…_diag2.bin` | Build cargada hoy en la placa (ELF SHA256 `8101118f…`): CS por software, `#CHIP`, `#I2CSCAN` |
+| `emg8-v02-storage-bench.bin` (SHA256 `7e98856c…8995`) | **NO cargada** (falló la carga, §4): barrido `#IMUCHK` de modo 0 y relojes 100–250 kHz, y reposo de SCK antes de la primera transacción |
+| `archivo/2026-10-22_…_imuchk2-drive.bin` (`9c9b51c5…2a3e`) | **La que corre en la placa** (`pio run -t upload`, verificada por hash): barrido `#IMUCHK` por grupo de salida |
+| `archivo/2026-10-22_…_imuchk1.bin` (`671de547…a75d`) | Primer `#IMUCHK` (fuerza 2/0 × 1 MHz/500 kHz) |
+| `archivo/2026-10-22_…_diag3.bin` (`4b71ef11…e676`) | La "más reciente" del traspaso de la mañana (`#RDYLINE`, `#ADCCH`, `#IDLE`, blindaje RDY). Nunca se cargó sola; su código va dentro de las dos siguientes |
+| `archivo/2026-10-22_…_diag2.bin` | El traspaso de la mañana decía que estaba cargada; **la lectura de flash de la tarde mostró `diag1`** (`archivo/2026-10-20_…_diag1.bin`, coincidencia byte a byte) |
 | `archivo/2026-10-20_device-app-before-v02.bin` | Respaldo de la app que traía la placa (*Prueba_Boards*) |
 
 Los logs de arranque están en `benchmarks/v02-bringup-2026-10-20/`. Esa carpeta
@@ -101,13 +105,74 @@ típico de un flanco de SCK de más por rebote o diafonía. Diagnóstico:
 **integridad de señal en SCK** con las dos bandas cargando el bus. En el conector
 de 14 pines, GND solo está en un extremo y SCK va entre MOSI y MISO.
 
+**`#IMUCHK` (tarde, dos bandas conectadas).** 1000 lecturas de WHO_AM_I por IMU
+y configuración, antes de `init()`. Fuerza de salida por grupo SCK·MOSI·CS
+(`GPIO_DRIVE_CAP_n`, de fábrica = 2):
+
+| Configuración | IMU0 placa | IMU1 | IMU2 | IMU3 | IMU4 |
+|---|---|---|---|---|---|
+| 222 a 1 MHz y a 500 kHz | ok (999 y 1000) | 0x44 ×1000 | ok | 0x44 ×1000 | ok |
+| 111, 333 | ok | 0x44 ×1000 | ok | 0x44 ×1000 | ok |
+| 322, 232, 223 (un grupo al máximo) | ok | 0x44 | ok | 0x44 | ok |
+| 202, 220 (MOSI o CS al mínimo) | ok | 0x44 | ok | 0x44 | ok |
+| **022, 000 (SCK al mínimo), 1 MHz y 500 kHz** | **0x44 ×1000** | 0x44 | **0x44 ×1000** | 0x44 | **0x44 ×1000** |
+
+Logs: `boot17-imuchk.log` (fuerza 2/0 × reloj), `boot18-imuchk-drive-sweep.log`
+(por grupo). Lo que dicen:
+- El error es **determinista** (1000 de 1000, siempre 0x44), no ruido aleatorio.
+- **El reloj no importa** (1 MHz = 500 kHz).
+- **SCK es la línea sensible:** SCK al mínimo lleva a 0x44 a las cinco IMU, la
+  de placa incluida, con el mismo valor exacto; MOSI o CS al mínimo no cambian
+  nada.
+- **Ninguna fuerza (1–3) ni reloj arregla IMU1/IMU3.** Bajar la fuerza a
+  `CAP_0`, que era el arreglo propuesto en la mañana, empeora: descartado.
+- IMU1 e IMU3 ocupan la misma posición en cada banda (módulo U5, el de ADC1/ADC3,
+  si las IMU siguen el orden de los ADC como dice `main.cpp`). El ADC3, del
+  mismo módulo de la banda derecha, se cayó en `boot18` (§3.5).
+
+Lo que falta para cerrar el mecanismo (hipótesis, sin medir): un SCK degradado
+en esa posición (reflexión en un tramo sin terminar, o un GND del módulo que
+flota respecto del ESP32: GND solo en un extremo del conector) da el mismo
+síntoma que SCK débil en todo el bus. En bits, 0x42 → 0x44 se lee como el `1`
+del bit 1 llegando una posición antes, como si el esclavo viera un flanco de
+más en el byte de datos. Siguiente paso de hardware: medir con osciloscopio
+SCK en el módulo U5 contra el GND local, y la diferencia de GND entre el ESP32
+y ese módulo con todo encendido.
+
 ### 3.4 Cuelgue después del arranque con ADC presentes
 - Con al menos un ADC presente, la app imprime `#READY` y `#MAC` y luego no responde a `?` (0 bytes a los 12 s y a los 30 s). No aparece watchdog, pánico ni brownout. Solo con el cerebro, sí responde.
 - Hipótesis: el pin RDY con interrupción habilitada desde el arranque, sin handler, cuyo ruido ocupa el servicio de ISR de GPIO en core 0. El blindaje de §2 lo ataca, y `#RDYLINE` / `#IDLE` lo confirmarán. **Requiere cargar la build nueva.**
+- **Tarde: no se reprodujo en tres arranques** con ADC presentes (`boot16` con `diag1`, que no tiene el blindaje; `boot17` y `boot18` con él): la app contesta `?` a los 12 y a los 30 s y `#IDLE` late cada 5 s. `#RDYLINE`: las cuatro líneas en alto y 0 flancos en 20 ms (salvo RDY3 en bajo en `boot18`, con el ADC3 caído). Ojo: en los tres la SD falló al iniciar (§3.5), y en los arranques que colgaban estaba lista; no se puede dar por cerrado hasta repetirlo con SD.
 
-## 4. Carga y puerto serie (problema abierto)
+### 3.5 ADC3, mapa de canales y SD (tarde)
+- **ADC3 intermitente.** `boot17`: aparece en el escaneo y en `#ADCCH`, pero la
+  escritura de `#RDYPROBE` falla (`#RDYPROBE:ERROR,3,-1`). `boot18`: no contesta
+  en I2C1 (`#I2CSCAN:1,…,49`, `ADC3 not found`, `#INIT:ADC=FAIL`) y su RDY
+  (GPIO15) queda en bajo. Ningún cambio de firmware entre esos arranques toca
+  I2C antes del escaneo. Revisar conector y alimentación del módulo U5 de la
+  banda derecha (el mismo de IMU3).
+- **`#ADCCH` no sirve aún para el mapa raw/envolvente**: los cuatro canales de
+  cada ADC leen 0–18 cuentas; ninguno está en el pedestal (~600) que en la v0.1
+  marcaba los raw. O la etapa analógica no está alimentada, o la v0.2 no tiene
+  ese pedestal. Hay que confirmarlo antes de tocar `kRawCh`/`kEnvCh`.
+- **SD**: `#ERR:SD_INIT:ESP_ERR_TIMEOUT` en los tres arranques de la tarde
+  (`boot7` del 20 la tenía `READY`). ¿Tarjeta puesta?
 
-Observaciones con el CP2102 de la cinta (COM4, VID:PID 10C4:EA60):
+## 4. Carga y puerto serie (intermitente)
+
+**El auto-reset por DTR/RTS funciona a ratos.** En la tarde, `pio run -e
+esp32-s3-storage-bench -t upload` (`default_reset`/`hard_reset`) cargó dos
+veces sin tocar la placa, `esptool read_flash` con el mismo reset leyó la
+partición de app, y `tools/capture_boot.py --reset` reinició la app por RTS
+tres veces. Después, sin cambios de software, **dos cargas seguidas fallaron**
+(`Failed to connect to ESP32-S3: No serial data received`) y el reset por RTS
+de `capture_boot.py` tampoco reinició la app (`#IDLE` siguió contando ~47 min),
+mientras el UART en los dos sentidos seguía bien (contesta `?`). Encaja con una
+conexión floja de DTR/RTS en la cinta, o en el circuito de auto-reset, más que
+con estados de línea; la mañana probablemente vio lo mismo. Cuando funciona,
+`pio run -t upload` es el camino; `tools/flash_noboot.py` queda obsoleto.
+
+Observaciones de la mañana con el CP2102 de la cinta (COM4, VID:PID 10C4:EA60):
 
 1. **No hay auto-reset fiable.** Ninguna combinación de DTR/RTS produce un banner del ROM.
 2. **Reset con el puerto abierto y DTR/RTS desactivados** → `boot:0x1 DOWNLOAD`, de forma reproducible.
@@ -134,13 +199,25 @@ Sugerencias para la próxima sesión:
 
 ## 6. Pendientes, en orden
 
-1. **Resolver la carga** (§4) y cargar `.dist/emg8-v02-storage-bench.bin`.
-2. Verificar el arranque con la build nueva: `#RDYLINE` (¿algún RDY oscila?), `#IDLE` presente y respuesta a `?`. Esto cierra §3.4.
-3. **Mapa raw/envolvente** con `#ADCCH`: los canales raw en el pedestal (~600), los de envolvente cerca de 0. Actualizar `kRawCh`/`kEnvCh`, que hoy son los de la v0.1.
-4. **Corrupción de SCK** (§3.3):
-   - Firmware: bajar la fuerza de salida de SCK, MOSI y CS a `GPIO_DRIVE_CAP_0` (~5 mA) y probar 500 kHz.
-   - Medir con un test de arranque `#IMUCHK:<imu>,<ok>,<mal>` (1000 lecturas de WHO_AM_I por IMU) para comparar configuraciones con números.
-   - Hardware, si no basta: resistencia serie de 22–47 Ω en SCK/MOSI junto al ESP32, y GND junto a SCK en el cable o el pinout de la próxima revisión.
-5. Medir tasas en `max` con las 5 IMU (§5) y, si hace falta, el regulador de IMU.
-6. Quitar `#IDLE` cuando esté validado. Revisar `UARTERR` de UART1.
-7. Commitear (pedir autorización): fase 2, correcciones de bring-up y herramientas.
+Hechos en la tarde: arranque con la build nueva y respuesta a `?` (§3.4, salvo
+la repetición con SD), y el barrido `#IMUCHK` de fuerza (§3.3).
+
+0. **Auto-reset intermitente** (§4): revisar DTR/RTS en la cinta del CP2102,
+   cargar `.dist/emg8-v02-storage-bench.bin` (`7e98856c…`, barrido de modo 0 y
+   100–250 kHz) y capturar con `tools/capture_boot.py --reset`.
+1. **Banda derecha, módulo U5**: reasentar el conector y revisar alimentación;
+   repetir el arranque y ver si vuelve el ADC3 (§3.5).
+2. **Etapa analógica / `#ADCCH`**: confirmar que está alimentada; con raw en su
+   pedestal, actualizar `kRawCh`/`kEnvCh` (hoy los de la v0.1).
+3. **SD**: tarjeta puesta y `READY`; con eso repetir la prueba del cuelgue (§3.4).
+4. **IMU1/IMU3** (§3.3): ya no es de firmware de fuerza ni de reloj. Medir SCK
+   y GND en el módulo U5 con osciloscopio. Hardware: resistencia serie de
+   22–47 Ω en SCK junto al ESP32, y GND junto a SCK en el cable o en el pinout
+   de la próxima revisión. Si se quiere apurar firmware: SPI modo 0 y relojes
+   de 100–250 kHz en el mismo barrido, por descarte.
+5. Medir tasas en `max` con las IMU que contesten (§5) y, si hace falta, el
+   regulador de IMU.
+6. Quitar `#IDLE` y el barrido `#IMUCHK` (~2 s de arranque) cuando esté
+   validado. Revisar `UARTERR` de UART1.
+7. Commitear (pedir autorización) `#IMUCHK`, `readWhoAmI()`,
+   `capture_boot.py --reset` y estos docs.
