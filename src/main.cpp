@@ -171,7 +171,7 @@ static constexpr int kIMU_SPI_HZ = 1000000;
  *
  *   ADC | crudo  | envolvente
  *   ----+--------+-----------
- *    1  | 0, 3   | 1, 2
+ *    1  | 0, 2   | 1, 3
  *    2  | 1, 3   | 0, 2
  *    3  | 0, 3   | 1, 2
  *    4  | 1, 3   | 0, 2
@@ -182,8 +182,8 @@ static constexpr int kIMU_SPI_HZ = 1000000;
  * crudas de esos electrodos se muestreaban con el divisor /20 a ~23 Hz y las
  * de envolvente a ~460 Hz, o sea justo al reves de lo que hace falta.
  */
-static constexpr uint8_t kRawCh[4][2] = {{0, 3}, {1, 3}, {0, 3}, {1, 3}};
-static constexpr uint8_t kEnvCh[4][2] = {{1, 2}, {0, 2}, {1, 2}, {0, 2}};
+static constexpr uint8_t kRawCh[4][2] = {{0, 2}, {0, 2}, {0, 2}, {0, 2}};
+static constexpr uint8_t kEnvCh[4][2] = {{1, 3}, {1, 3}, {1, 3}, {1, 3}};
 
 static inline bool isRawCh(uint8_t adcId, uint8_t ch) {
     return ch == kRawCh[adcId & 3][0] || ch == kRawCh[adcId & 3][1];
